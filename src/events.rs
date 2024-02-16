@@ -9,13 +9,26 @@ pub struct EventData<T: ?Sized + Serialize> {
 }
 impl<T: ?Sized + Serialize> EventData<T> {
 
-    pub fn to_json(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
+    pub fn to_json(&self) -> serde_json::Result<Vec<u8>> {
+        serde_json::to_vec(self)
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize, Deserialize)]
 pub enum Event {
-    MotionUpdate = 0,
-    EntityCreate = 1
+    EntityCreate = 0,
+    EntityDelete = 1,
+    DirectionChange = 2,
+    YawChange = 3,
+    MotionUpdate = 4
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DirectionChange {
+    pub direction: i32
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct YawChange {
+    pub yaw: i32
 }
