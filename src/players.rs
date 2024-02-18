@@ -1,9 +1,9 @@
-use std::{ops::{Add, AddAssign}, sync::Arc};
+use std::{fmt::Debug, ops::{Add, AddAssign}, sync::Arc};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
 use log::warn;
 use serde::Serialize;
 use serde_json::value::RawValue;
-use tokio::{net::TcpStream, sync::{broadcast, RwLock, RwLockWriteGuard}};
+use tokio::{net::TcpStream, sync::{broadcast, RwLock}};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 use uuid::Uuid;
@@ -41,6 +41,7 @@ impl AddAssign for Coordinates {
     }
 }
 
+
 pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
     let radians = yaw as f64 * std::f64::consts::PI / 180.;
     Coordinates { 
@@ -52,10 +53,22 @@ pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
 
 pub async fn forward_messages_from_channel(
     conn: &mut SplitSink<WebSocketStream<TcpStream>, Message>, 
-    messages: &mut broadcast::Receiver<Vec<u8>>) {
-    while let Ok(message) = messages.recv().await {
-        if let Err(e) = conn.send(tungstenite::Message::Binary(message)).await {
-            warn!("Error sending data: {:?}", e);
+    messages: &mut broadcast::Receiver<Vec<u8>>,
+    close_messages: &mut broadcast::Receiver<()>
+) {
+    loop {
+        tokio::select! {
+            Ok(message) = messages.recv() => {
+                if let Err(e) = conn.send(tungstenite::Message::Binary(message)).await {
+                    warn!("Error sending data: {:?}", e);
+                }
+            }
+            Ok(_) = close_messages.recv() => {
+                if let Err(e) = conn.close().await {
+                    warn!("Failed to close connection: {:?}", e);
+                }
+                return;
+            }
         }
     }
 }
@@ -63,17 +76,24 @@ pub async fn forward_messages_from_channel(
 pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<WebSocketStream<TcpStream>>, hub: Arc<Hub>) {
     read.try_filter(|msg| future::ready(msg.is_text()))
     .for_each(|m| async {
+        if m.is_err() {
+            return;
+        }
         let text = m.unwrap().into_data();
-        let event: EventData<&RawValue> = serde_json::from_slice(text.as_slice()).unwrap();
+        let event: Result<EventData<&RawValue>, _> = serde_json::from_slice(text.as_slice());
         let entity = &mut player.write().await;
+        if event.is_err() {
+            hub.kick_player(entity.id);
+            return;
+        }
+        let event = event.unwrap();
         let result: Result<(), ()> = match event.event {
-            Event::DirectionChange => change_direction(entity, event.data, &hub),
-            Event::YawChange => change_yaw(entity, event.data, &hub),
+            Event::DirectionChange => entity.change_direction(serde_json::from_str(event.data.get()) , &hub),
+            Event::YawChange => entity.change_yaw(serde_json::from_str(event.data.get()), &hub),
             _ => Err(())
         };
         if result.is_err() {
-            // kick client if they send an invalid request
-            return;
+            hub.kick_player(entity.id);
         }
     }).await;
 }
@@ -83,47 +103,9 @@ fn is_valid_degree(yaw: i32) -> bool {
 }
 
 
-fn change_direction<'a>(entity: &mut RwLockWriteGuard<'a, Entity>, direction_data: &RawValue, hub: &Arc<Hub>) -> Result<(), ()>{
-    let direction: Result<DirectionChange, serde_json::Error> = serde_json::from_str(direction_data.get());
-    if direction.is_err() {
-        return Err(());
-    }
-    let direction = direction.unwrap();
-    if !is_valid_degree(direction.direction) {
-        return Err(());
-    }
-    let change = yaw_coordinate_change(direction.direction);
-    entity.acceleration = Coordinates {
-        x: change.x / 10.,
-        y: change.y / 10.
-    };
-    hub.dispatch_event(&EventData {
-        event: Event::MotionUpdate,
-        data: entity.clone()
-    });
-    Ok(())
-}
-
-fn change_yaw<'a>(entity: &mut RwLockWriteGuard<'a, Entity>, yaw_raw_data: &RawValue, hub: &Arc<Hub>) -> Result<(), ()> {
-    let yaw_update: Result<YawChange, serde_json::Error> = serde_json::from_str(yaw_raw_data.get());
-    if yaw_update.is_err() {
-        return Err(());
-    }
-    let yaw_update_data = yaw_update.unwrap();
-    if !is_valid_degree(yaw_update_data.yaw) {
-        return Err(());
-    }
-    entity.yaw = yaw_update_data.yaw;
-    hub.dispatch_event(&EventData {
-        event: Event::MotionUpdate,
-        data: entity.clone()
-    });
-    Ok(())
-}
-
-
 pub struct Player {
-    pub messages: broadcast::Sender<Vec<u8>>
+    pub messages: broadcast::Sender<Vec<u8>>,
+    pub closer: broadcast::Sender<()>
 }
 
 #[derive(Serialize, Clone)]
@@ -131,6 +113,7 @@ pub struct Entity {
     pub id: Uuid,
     pub coordinates: Coordinates,
     pub velocity: Coordinates,
+    pub max_velocity: Coordinates,
     pub acceleration: Coordinates,
     pub size: f32,
     pub yaw: i32
@@ -143,6 +126,7 @@ impl Entity {
             id,
             coordinates: coords,
             velocity: Coordinates::empty(),
+            max_velocity: Coordinates::empty(),
             acceleration: Coordinates::empty(),
             size: 5.,
             yaw: 0
@@ -151,6 +135,48 @@ impl Entity {
 
     pub fn move_once(&mut self) {
         self.coordinates += self.velocity.clone();
-        self.velocity += self.acceleration.clone();
+        let velo = self.velocity.clone() + self.acceleration.clone();
+        if velo.x.abs() > self.max_velocity.x.abs() || velo.y.abs() > self.max_velocity.y.abs() {
+            self.velocity = self.max_velocity.clone();
+        } else {
+            self.velocity = velo;
+        }
+    }
+    fn change_direction<'a, T: Debug>(&mut self, direction: Result<DirectionChange, T>, hub: &Arc<Hub>) -> Result<(), ()>{
+        if direction.is_err() {
+            return Err(());
+        }
+        let direction = direction.unwrap();
+        let x_mod = direction.down as i32 - direction.up as i32;
+        let y_mod = direction.left as i32 - direction.right as i32;
+        self.acceleration = Coordinates {
+            x: x_mod as f64 / 10.,
+            y: y_mod as f64 / 10.
+        };
+        self.max_velocity = Coordinates {
+            x: x_mod as f64,
+            y: y_mod as f64
+        };
+        hub.dispatch_event(&EventData {
+            event: Event::MotionUpdate,
+            data: self.clone()
+        });
+        Ok(())
+    }
+    
+    fn change_yaw<'a, T: Debug>(&mut self, yaw_update: Result<YawChange, T>, hub: &Arc<Hub>) -> Result<(), ()> {
+        if yaw_update.is_err() {
+            return Err(());
+        }
+        let yaw_update_data = yaw_update.unwrap();
+        if !is_valid_degree(yaw_update_data.yaw) {
+            return Err(());
+        }
+        self.yaw = yaw_update_data.yaw;
+        hub.dispatch_event(&EventData {
+            event: Event::MotionUpdate,
+            data: self.clone()
+        });
+        Ok(())
     }
 }

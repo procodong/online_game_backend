@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde;
+use uuid::Uuid;
 
 #[derive(Deserialize, Serialize)]
-#[serde()]
 pub struct EventData<T: ?Sized + Serialize> {
     pub event: Event,
     pub data: T
@@ -25,10 +25,18 @@ pub enum Event {
 
 #[derive(Serialize, Deserialize)]
 pub struct DirectionChange {
-    pub direction: i32
+    pub up: bool,
+    pub left: bool,
+    pub down: bool,
+    pub right: bool
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct YawChange {
     pub yaw: i32
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Identifiable {
+    pub id: Uuid
 }
