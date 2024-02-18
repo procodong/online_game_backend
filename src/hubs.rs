@@ -103,11 +103,7 @@ impl Hub {
     }
 
     pub fn kick_player(&self, id: Uuid) {
-        if let Some((_, player)) = self.players.remove(&id) {
-            if let Err(e) = player.closer.send(()) {
-                warn!("Error kicking player: {:?}", e);
-            }
-        }
+        self.players.remove(&id);
         self.remove_entity(id);
     }
 
@@ -138,7 +134,6 @@ impl Hub {
         let (mut ws_sender, ws_receiver) = stream.split();
 
         let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
-        let (closer, mut close_messages) = broadcast::channel::<()>(16);
         let coords = Coordinates {
             x: self.random_coordinate(),
             y: self.random_coordinate()
@@ -149,14 +144,12 @@ impl Hub {
         tokio::spawn(listen_for_messages(entity.clone(), ws_receiver, self.clone()));
 
         let player = Player {
-            messages: sender,
-            closer
+            messages: sender
         };
         self.players.insert(id, player);
         forward_messages_from_channel(
             &mut ws_sender, 
-            &mut receiver,
-            &mut close_messages
+            &mut receiver
         ).await;
     }
 }

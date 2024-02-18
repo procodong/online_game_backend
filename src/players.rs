@@ -1,6 +1,6 @@
 use std::{fmt::Debug, ops::{Add, AddAssign}, sync::Arc};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
-use log::warn;
+use log::{info, warn};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use tokio::{net::TcpStream, sync::{broadcast, RwLock}};
@@ -53,23 +53,17 @@ pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
 
 pub async fn forward_messages_from_channel(
     conn: &mut SplitSink<WebSocketStream<TcpStream>, Message>, 
-    messages: &mut broadcast::Receiver<Vec<u8>>,
-    close_messages: &mut broadcast::Receiver<()>
+    messages: &mut broadcast::Receiver<Vec<u8>>
 ) {
-    loop {
-        tokio::select! {
-            Ok(message) = messages.recv() => {
-                if let Err(e) = conn.send(tungstenite::Message::Binary(message)).await {
-                    warn!("Error sending data: {:?}", e);
-                }
-            }
-            Ok(_) = close_messages.recv() => {
-                if let Err(e) = conn.close().await {
-                    warn!("Failed to close connection: {:?}", e);
-                }
-                return;
-            }
+    while let Ok(message) = messages.recv().await {
+        if let Err(e) = conn.send(tungstenite::Message::Binary(message)).await {
+            warn!("Error sending data: {:?}", e);
         }
+    }
+    if let Err(e) = conn.close().await {
+        warn!("Error closing connection: {:?}", e);
+    } else {
+        info!("Closed connection succesfully");
     }
 }
 
@@ -104,8 +98,7 @@ fn is_valid_degree(yaw: i32) -> bool {
 
 
 pub struct Player {
-    pub messages: broadcast::Sender<Vec<u8>>,
-    pub closer: broadcast::Sender<()>
+    pub messages: broadcast::Sender<Vec<u8>>
 }
 
 #[derive(Serialize, Clone)]
