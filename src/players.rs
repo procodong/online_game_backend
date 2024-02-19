@@ -140,8 +140,9 @@ impl Entity {
             return Err(());
         }
         let direction = direction.unwrap();
-        let x_mod = direction.down as i32 - direction.up as i32;
-        let y_mod = direction.left as i32 - direction.right as i32;
+        // if down is true 1 if up is true -1
+        let x_mod = direction.down as i32 - direction.up as i32; 
+        let y_mod = direction.right as i32 - direction.left as i32;
         self.acceleration = Coordinates {
             x: x_mod as f64 / 10.,
             y: y_mod as f64 / 10.
