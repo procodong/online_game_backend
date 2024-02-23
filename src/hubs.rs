@@ -1,5 +1,5 @@
-use std::{array, sync::Arc, time::Duration};
-use dashmap::{DashMap, DashSet};
+use std::{array, collections::HashMap, sync::Arc, time::Duration};
+use dashmap::DashMap;
 use futures_util::StreamExt;
 use log::warn;
 use rand::Rng;
@@ -15,8 +15,8 @@ pub struct HubManager {
 }
 impl HubManager {
 
-    pub async fn new() -> HubManager {
-        HubManager { hubs: DashMap::new(), config: Config::get().await }
+    pub fn new() -> HubManager {
+        HubManager { hubs: DashMap::new(), config: Config::get() }
     }
 
     fn find_hub(&self) -> Option<Arc<Hub>> {
@@ -65,23 +65,23 @@ impl Hub {
         });
     }
     
-    async fn move_entity(&self, entity: &Arc<RwLock<Entity>>, tiles: &mut EntityTree) {
+    async fn move_entity(&self, entity: &Arc<RwLock<Entity>>, tiles: &mut PlayerPositions) {
         let mut entity_data = entity.write().await;
-      //  let old_coords = entity_data.coordinates.clone();
+        let old_coords = entity_data.coordinates.clone();
         entity_data.move_once();
-       // if tiles.add(entity_data.id, &entity_data.coordinates, &self.config, self.entities) {
-
-       // }
+        if tiles.add(entity, entity_data.coordinates.clone(), entity_data.id) {
+            tiles.remove(entity_data.id, old_coords);
+        }
     } 
 
-    async fn update_all_entities(&self, tiles: &mut EntityTree) {
+    async fn update_all_entities(&self, tiles: &mut PlayerPositions) {
         for entity in self.entities.iter() {
             self.move_entity(entity.value(), tiles).await;
         }
     } 
 
     async fn game_update_loop(&self) {
-        let mut tiles = EntityTree::Single(DashSet::new());
+        let mut tiles = PlayerPositions::new(self.config.map_size / 10.);
         let mut interval = time::interval(Duration::from_millis(self.config.update_delay_ms));
         loop {
             interval.tick().await;
@@ -154,83 +154,44 @@ impl Hub {
     }
 }
 
-pub enum EntityTree {
-    Single(DashSet<Uuid>),
-    Quad(Box<[[EntityTree; 2]; 2]>)
+type Tile = Option<HashMap<Uuid, Arc<RwLock<Entity>>>>;
+
+struct PlayerPositions {
+    tiles: [[Tile; 10]; 10],
+    scale: f64
 }
+impl PlayerPositions {
 
-
-fn get_tile_index(relative_x: f64, relative_y: f64, tile_size: f64) -> (usize, usize) {
-    (
-        (relative_x / tile_size).round() as usize, 
-        (relative_y / tile_size).round() as usize
-    )
-}
-
-impl EntityTree {
-
-    pub fn split(self, offset: Coordinates, size: f64, entities: &DashMap<Uuid, Entity>) -> EntityTree {
-        if let EntityTree::Quad(_) = self {
-            return self;
+    fn new(scale: f64) -> Self {
+        Self {
+            tiles: array::from_fn(|_|  array::from_fn(|_| None)),
+            scale
         }
-        let EntityTree::Single(values) = self else {panic!()};
-        let splitted_values: [[EntityTree; 2]; 2] = array::from_fn(|_|array::from_fn(|_| EntityTree::Single(DashSet::new())));
-        for id in values.iter() {
-            let entity = entities.get(&id);
-            if entity.is_none() {
-                continue;
-            }
-            let coords = &entity.unwrap().coordinates;
-            if coords.x < offset.x || coords.y < offset.y || coords.x > offset.x + size || coords.y > offset.y + size {
-                println!("entity found at wrong tile");
-                continue;
-            }
-            let (x, y) = get_tile_index(coords.x - offset.x, coords.y - offset.y, size);
-            if let EntityTree::Single(v) = &splitted_values[y][x] {
-                v.insert(*id);
-            }
-        }
-        EntityTree::Quad(Box::new(splitted_values))
     }
 
-    pub fn add(&mut self, id: Uuid, coords: &Coordinates, config: &Config, other_entities: &DashMap<Uuid, Entity>) -> bool {
-        let (tile, offset, size) = self.find_entity(coords, config);
-        if let EntityTree::Single(entities) = tile {
-            let result = entities.insert(id);
-            if entities.len() > config.max_tile_player_count {
-              //  *tile = tile.split(offset, size, other_entities);
-            }
-            return result;
-        }
-        false
+    fn get(&mut self, coords: Coordinates) -> &mut Tile {
+        &mut self.tiles[coords.y as usize / self.scale as usize][coords.x as usize / self.scale as usize]
     }
 
-    pub fn remove(&mut self, id: Uuid, coords: &Coordinates, config: &Config) {
-        let (tile, offset, size) = self.find_entity(coords, config);
-        if let EntityTree::Single(entities) = tile {
+    fn add(&mut self, entity: &Arc<RwLock<Entity>>, coords: Coordinates, id: Uuid) -> bool {
+        let tile = self.get(coords);
+        if let Some(entities) = tile {
+            entities.insert(id, entity.clone()).is_none()
+        } else {
+            let mut values = HashMap::new();
+            values.insert(id, entity.clone());
+            *tile = Some(values);
+            true
+        }
+    }
+
+    fn remove(&mut self, id: Uuid, coords: Coordinates) {
+        let tile = self.get(coords);
+        if let Some(entities) = tile {
             entities.remove(&id);
+            if entities.is_empty() {
+                *tile = None;
+            }
         }
-    }
-
-    fn scan(&mut self, tile_size: f64, relative_x: f64, relative_y: f64, offset_x: f64, offset_y: f64) -> (&mut EntityTree, Coordinates, f64) {
-        if let EntityTree::Single(_) = self {
-            return (self, Coordinates {x: offset_x, y: offset_y}, tile_size);
-        }
-        let EntityTree::Quad(tree) = self else {panic!()};
-        let (x_tile_index, y_tile_index) = get_tile_index(relative_x, relative_y, tile_size);
-        let value = &mut tree[y_tile_index][x_tile_index];
-        let x_quad_pos = tile_size * x_tile_index as f64;
-        let y_quad_pos = tile_size * y_tile_index as f64;
-        value.scan(
-            tile_size / 2., 
-            relative_x - x_quad_pos, 
-            relative_y - y_quad_pos,
-            offset_x + x_quad_pos,
-            offset_y + y_quad_pos
-        )
-    }
-
-    fn find_entity(&mut self, coords: &Coordinates, config: &Config) -> (&mut EntityTree, Coordinates, f64) {
-        self.scan(config.map_size, coords.x, coords.y, 0., 0.)
     }
 }

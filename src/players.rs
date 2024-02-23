@@ -1,4 +1,4 @@
-use std::{fmt::Debug, ops::{Add, AddAssign}, sync::Arc};
+use std::{array, ops::{Add, AddAssign}, sync::Arc};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
 use log::{info, warn};
 use serde::Serialize;
@@ -8,13 +8,14 @@ use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 use uuid::Uuid;
 
-use crate::{events::{DirectionChange, Event, EventData, YawChange}, hubs::Hub};
+use crate::{events::{DirectionChange, Event, EventData, YawChange}, get_env, hubs::Hub};
 
 #[derive(Serialize, Clone)]
 pub struct Coordinates {
     pub x: f64,
     pub y: f64
 }
+
 impl Coordinates {
     fn empty() -> Self {
         Self {
@@ -75,7 +76,7 @@ pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<
         }
         let text = m.unwrap().into_data();
         let event: Result<EventData<&RawValue>, _> = serde_json::from_slice(text.as_slice());
-        let entity = &mut player.write().await;
+        let mut entity =  player.write().await;
         if event.is_err() {
             hub.kick_player(entity.id);
             return;
@@ -92,11 +93,6 @@ pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<
     }).await;
 }
 
-fn is_valid_degree(yaw: i32) -> bool {
-    yaw <= 360 && yaw >= 0
-}
-
-
 pub struct Player {
     pub messages: broadcast::Sender<Vec<u8>>
 }
@@ -104,12 +100,19 @@ pub struct Player {
 #[derive(Serialize, Clone)]
 pub struct Entity {
     pub id: Uuid,
+    // Position in the map
     pub coordinates: Coordinates,
+    // Amount coordinates is changed when moved
     pub velocity: Coordinates,
+    // Max amount of amount coordinates is user
     pub max_velocity: Coordinates,
+    // Amount velocity is changed when moved
     pub acceleration: Coordinates,
     pub size: f32,
-    pub yaw: i32
+    pub yaw: i32,
+    cannons: Vec<i32>,
+    points: i32, 
+    pub levels: [u8; 8]
 }
 
 impl Entity {
@@ -122,25 +125,43 @@ impl Entity {
             max_velocity: Coordinates::empty(),
             acceleration: Coordinates::empty(),
             size: 5.,
-            yaw: 0
+            yaw: 0,
+            levels: array::from_fn(|_| 0),
+            cannons: Vec::new(),
+            points: 0
         }
+    }
+
+    pub fn level(&self, stat: Stat) -> u8 {
+        self.levels[stat as usize]
+    }
+
+    pub fn stat_multiplier(&self, stat: Stat) -> f32 {
+        1. + self.level(stat) as f32 / 10.
+    }
+
+    pub fn increment_level(&mut self, stat: Stat) {
+        let max_level: u8 = get_env("MAX_LEVEL");
+        let current_level = self.level(stat.clone());
+        if current_level < max_level {
+            self.levels[stat as usize] += 1;
+        }
+    }
+
+    fn velocity<F: Fn(&Coordinates) -> f64>(&self, axis: F) -> f64 {
+        (axis(&self.max_velocity) - axis(&self.velocity)) / 10.
     }
 
     pub fn move_once(&mut self) {
         self.coordinates += self.velocity.clone();
-        let velo = self.velocity.clone() + self.acceleration.clone();
-        if velo.x.abs() > self.max_velocity.x.abs() || velo.y.abs() > self.max_velocity.y.abs() {
-            self.velocity = self.max_velocity.clone();
-        } else {
-            self.velocity = velo;
-        }
+        self.velocity = Coordinates {
+            x: self.velocity(|c| c.x),
+            y: self.velocity(|c| c.y)
+        };
     }
-    fn change_direction<'a, T: Debug>(&mut self, direction: Result<DirectionChange, T>, hub: &Arc<Hub>) -> Result<(), ()>{
-        if direction.is_err() {
-            return Err(());
-        }
-        let direction = direction.unwrap();
-        // if down is true 1 if up is true -1
+
+    fn change_direction<T>(&mut self, direction: Result<DirectionChange, T>, hub: &Arc<Hub>) -> Result<(), ()>{
+        let Ok(direction) = direction else {return Err(());};
         let x_mod = direction.down as i32 - direction.up as i32; 
         let y_mod = direction.right as i32 - direction.left as i32;
         self.acceleration = Coordinates {
@@ -153,24 +174,37 @@ impl Entity {
         };
         hub.dispatch_event(&EventData {
             event: Event::MotionUpdate,
-            data: self.clone()
+            data: &self
         });
         Ok(())
     }
     
-    fn change_yaw<'a, T: Debug>(&mut self, yaw_update: Result<YawChange, T>, hub: &Arc<Hub>) -> Result<(), ()> {
-        if yaw_update.is_err() {
-            return Err(());
-        }
-        let yaw_update_data = yaw_update.unwrap();
-        if !is_valid_degree(yaw_update_data.yaw) {
-            return Err(());
+    fn change_yaw<T>(&mut self, yaw_update: Result<YawChange, T>, hub: &Arc<Hub>) -> Result<(), ()> {
+        let Ok(yaw_update_data) = yaw_update else {return Err(());};
+        if yaw_update_data.yaw == self.yaw {
+            return Ok(());
         }
         self.yaw = yaw_update_data.yaw;
         hub.dispatch_event(&EventData {
             event: Event::MotionUpdate,
-            data: self.clone()
+            data: &self
         });
         Ok(())
     }
+}
+
+#[derive(Clone)]
+pub enum Stat {
+    HealthRegen = 0,
+    MaxHealth = 1,
+    BodyDamage = 2,
+    BulletSpeed = 3,
+    BulletPenetration = 4,
+    BulletDamage = 5,
+    Reload = 6,
+    MovementSpeed = 7
+}
+
+pub trait SendTick {
+    fn tick(&mut self, tick: u64);
 }
