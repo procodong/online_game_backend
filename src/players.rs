@@ -1,16 +1,16 @@
 use std::{array, ops::{Add, AddAssign}, sync::Arc};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
 use log::{info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use tokio::{net::TcpStream, sync::{broadcast, RwLock}};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 use uuid::Uuid;
 
-use crate::{events::{DirectionChange, Event, EventData, YawChange}, get_env, hubs::Hub};
+use crate::{events::{DirectionChange, Event, EventData, YawChange}, hubs::Hub, Config};
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct Coordinates {
     pub x: f64,
     pub y: f64
@@ -22,6 +22,30 @@ impl Coordinates {
             x: 0., 
             y: 0.
         }
+    }
+
+    pub fn min(&mut self, other: &Coordinates) -> &mut Self {
+        if self.x < other.x {
+            self.x = other.x;
+        } if self.y < other.y {
+            self.y = other.y;
+        }
+        self
+    }
+
+    pub fn cap(&mut self, max: &Coordinates) -> &mut Self {
+        if self.x > max.x {
+            self.x = max.x;
+        } if self.y > max.y {
+            self.y = max.y;
+        }
+        self
+    }
+
+    pub fn combine(&mut self, other: &Coordinates) -> &mut Self {
+        self.x += other.x;
+        self.y += other.y;
+        self
     }
 }
 
@@ -42,7 +66,6 @@ impl AddAssign for Coordinates {
     }
 }
 
-
 pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
     let radians = yaw as f64 * std::f64::consts::PI / 180.;
     Coordinates { 
@@ -51,13 +74,12 @@ pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
     }
 }
 
-
 pub async fn forward_messages_from_channel(
     conn: &mut SplitSink<WebSocketStream<TcpStream>, Message>, 
-    messages: &mut broadcast::Receiver<Vec<u8>>
+    messages: &mut broadcast::Receiver<Message>
 ) {
     while let Ok(message) = messages.recv().await {
-        if let Err(e) = conn.send(tungstenite::Message::Binary(message)).await {
+        if let Err(e) = conn.send(message).await {
             warn!("Error sending data: {:?}", e);
         }
     }
@@ -83,8 +105,8 @@ pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<
         }
         let event = event.unwrap();
         let result: Result<(), ()> = match event.event {
-            Event::DirectionChange => entity.change_direction(serde_json::from_str(event.data.get()) , &hub),
-            Event::YawChange => entity.change_yaw(serde_json::from_str(event.data.get()), &hub),
+            Event::DirectionChange => entity.direction_change_event(serde_json::from_str(event.data.get()) , &hub),
+            Event::YawChange => entity.yaw_change_event(serde_json::from_str(event.data.get()), &hub),
             _ => Err(())
         };
         if result.is_err() {
@@ -93,11 +115,7 @@ pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<
     }).await;
 }
 
-pub struct Player {
-    pub messages: broadcast::Sender<Vec<u8>>
-}
-
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct Entity {
     pub id: Uuid,
     // Position in the map
@@ -110,14 +128,14 @@ pub struct Entity {
     pub acceleration: Coordinates,
     pub size: f32,
     pub yaw: i32,
-    cannons: Vec<i32>,
-    points: i32, 
-    pub levels: [u8; 8]
+    pub tank: Arc<Tank>,
+    pub levels: [u8; 8],
+    pub stats: EntityType
 }
 
 impl Entity {
 
-    pub fn new(coords: Coordinates, id: Uuid) -> Self {
+    pub fn new(coords: Coordinates, id: Uuid, config: &Config, inner: EntityType) -> Self {
         Self {
             id,
             coordinates: coords,
@@ -127,8 +145,8 @@ impl Entity {
             size: 5.,
             yaw: 0,
             levels: array::from_fn(|_| 0),
-            cannons: Vec::new(),
-            points: 0
+            tank: config.tanks[0].clone(),
+            stats: inner
         }
     }
 
@@ -137,31 +155,59 @@ impl Entity {
     }
 
     pub fn stat_multiplier(&self, stat: Stat) -> f32 {
-        1. + self.level(stat) as f32 / 10.
+        match stat {
+            Stat::Reload => 1. - self.level(stat) as f32 / 20.,
+            _ => 1. + self.level(stat) as f32 / 10.
+        }
     }
 
+    fn base_stat(&self, stat: Stat) -> i32 {
+        self.tank.base_stats[stat as usize]
+    }
+
+    fn stat(&self, stat: Stat) -> i32 {
+        (self.stat_multiplier(stat.clone()) * self.base_stat(stat) as f32) as i32
+    }
+    
+    pub fn active_cannons(&self, tick: u32) -> impl Iterator<Item = &Cannon> {
+        let speed =  self.stat(Stat::Reload);
+        self.tank.cannons.iter().filter(move |c| c.delay * speed % tick as i32 == 0)
+    }
+
+    const MAX_LEVEL: u8 = 10;
+
+    // This function shouldn't be accessible for a non-player entity
+    // Oh well!
     pub fn increment_level(&mut self, stat: Stat) {
-        let max_level: u8 = get_env("MAX_LEVEL");
         let current_level = self.level(stat.clone());
-        if current_level < max_level {
+        if current_level + 1 >= Self::MAX_LEVEL {
+            return;
+        }
+        if let EntityType::Player(p) = &mut self.stats {
+            if p.points == 0 {
+                return;
+            }
+            p.points -= 1;
             self.levels[stat as usize] += 1;
         }
     }
 
-    fn velocity<F: Fn(&Coordinates) -> f64>(&self, axis: F) -> f64 {
-        (axis(&self.max_velocity) - axis(&self.velocity)) / 10.
-    }
-
     pub fn move_once(&mut self) {
-        self.coordinates += self.velocity.clone();
-        self.velocity = Coordinates {
-            x: self.velocity(|c| c.x),
-            y: self.velocity(|c| c.y)
-        };
+        self.coordinates.combine(&self.velocity);
+        self.velocity.combine(&self.acceleration).cap(&self.max_velocity);
     }
 
-    fn change_direction<T>(&mut self, direction: Result<DirectionChange, T>, hub: &Arc<Hub>) -> Result<(), ()>{
+    fn direction_change_event(&mut self, direction: serde_json::Result<DirectionChange>, hub: &Arc<Hub>) -> Result<(), ()> {
         let Ok(direction) = direction else {return Err(());};
+        self.change_direction(direction);
+        hub.dispatch_event(&EventData {
+            event: Event::MotionUpdate,
+            data: &self
+        });
+        Ok(())
+    }
+
+    pub fn change_direction(&mut self, direction: DirectionChange) {
         let x_mod = direction.down as i32 - direction.up as i32; 
         let y_mod = direction.right as i32 - direction.left as i32;
         self.acceleration = Coordinates {
@@ -172,6 +218,11 @@ impl Entity {
             x: x_mod as f64,
             y: y_mod as f64
         };
+    }
+
+    fn yaw_change_event(&mut self, yaw_update: serde_json::Result<YawChange>, hub: &Arc<Hub>) -> Result<(), ()> {
+        let Ok(yaw_update_data) = yaw_update else {return Err(());};
+        self.change_yaw(yaw_update_data);
         hub.dispatch_event(&EventData {
             event: Event::MotionUpdate,
             data: &self
@@ -179,17 +230,11 @@ impl Entity {
         Ok(())
     }
     
-    fn change_yaw<T>(&mut self, yaw_update: Result<YawChange, T>, hub: &Arc<Hub>) -> Result<(), ()> {
-        let Ok(yaw_update_data) = yaw_update else {return Err(());};
-        if yaw_update_data.yaw == self.yaw {
-            return Ok(());
+    fn change_yaw(&mut self, yaw_update: YawChange) {
+        if yaw_update.yaw == self.yaw {
+            return;
         }
-        self.yaw = yaw_update_data.yaw;
-        hub.dispatch_event(&EventData {
-            event: Event::MotionUpdate,
-            data: &self
-        });
-        Ok(())
+        self.yaw = yaw_update.yaw;
     }
 }
 
@@ -205,6 +250,40 @@ pub enum Stat {
     MovementSpeed = 7
 }
 
-pub trait SendTick {
-    fn tick(&mut self, tick: u64);
+#[derive(Debug, Clone, Deserialize)]
+pub struct Cannon {
+    pub yaw: i32,
+    pub delay: i32,
+    pub size: i32
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Tank {
+    pub cannons: Vec<Cannon>,
+    pub base_stats: [i32; 8],
+    pub size: f64,
+    pub id: i32
+}
+
+impl Serialize for Tank {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i32(self.id)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub enum EntityType {
+    Player(Player),
+    Bullet(Bullet)
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct Player {
+    pub points: i32,
+    pub score: i32
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct Bullet {
+    pub author: Uuid
 }

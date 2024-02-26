@@ -9,8 +9,8 @@ pub struct EventData<T: ?Sized + Serialize> {
 }
 impl<T: ?Sized + Serialize> EventData<T> {
 
-    pub fn to_json(&self) -> serde_json::Result<Vec<u8>> {
-        serde_json::to_vec(self)
+    pub fn to_json(&self) -> Vec<u8> {
+        serde_json::to_vec(self).unwrap()
     }
 }
 
@@ -20,7 +20,8 @@ pub enum Event {
     EntityDelete = 1,
     DirectionChange = 2,
     YawChange = 3,
-    MotionUpdate = 4
+    MotionUpdate = 4,
+    ToggleShooting= 5
 }
 
 #[derive(Serialize, Deserialize)]
@@ -37,6 +38,6 @@ pub struct YawChange {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct Identifiable {
+pub struct Identity {
     pub id: Uuid
 }

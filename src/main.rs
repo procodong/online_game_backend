@@ -1,8 +1,10 @@
-pub mod hubs;
+mod hubs;
 pub mod players;
 mod events;
+mod tests;
 
-use std::{env, fmt::Debug, io::Error, str::FromStr, sync::Arc};
+use std::{env, fmt::Debug, io::Error, path::Path, str::FromStr, sync::Arc};
+use players::Tank;
 use serde::Deserialize;
 use log::info;
 use tokio::net::{TcpListener, TcpStream};
@@ -12,7 +14,7 @@ use crate::hubs::HubManager;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let _ = env_logger::try_init();
-    let hubs = Arc::new(HubManager::new());
+    let hubs = Arc::new(HubManager::new().await);
     let listener = TcpListener::bind(&"127.0.0.1:8080".to_string()).await.expect("Failed to bind");
     info!("Listening on: http://localhost:8080/");
     while let Ok((stream, _)) = listener.accept().await {
@@ -33,7 +35,8 @@ async fn accept_connection(stream: TcpStream, hubs: Arc<HubManager>) {
 pub struct Config {
     max_player_count: i32,
     map_size: f64,
-    update_delay_ms: u64
+    update_delay_ms: u64,
+    tanks: Vec<Arc<Tank>>
 }
 
 pub fn get_env<T: FromStr>(name: &str) -> T where <T as FromStr>::Err: Debug {
@@ -41,11 +44,8 @@ pub fn get_env<T: FromStr>(name: &str) -> T where <T as FromStr>::Err: Debug {
 } 
 
 impl Config {
-    pub fn get() -> Config {
-        Config {
-            max_player_count: get_env("MAX_PLAYER_COUNT"),
-            map_size: get_env("MAP_SIZE"),
-            update_delay_ms: get_env("UPDATE_DELAY_MS")
-        }
+    pub async fn get() -> Config {
+        let data = tokio::fs::read(Path::new("../config.json")).await.expect("Error opening config");
+        serde_json::from_slice(&data.as_slice()).expect("Error deserializing config")
     }
 }

@@ -6,8 +6,9 @@ use rand::Rng;
 use serde::Serialize;
 use tokio::{net::TcpStream, sync::{broadcast, RwLock}, time};
 use tokio_tungstenite::WebSocketStream;
+use tungstenite::Message;
 use uuid::Uuid;
-use crate::{events::{Event, EventData, Identifiable}, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, Player}, Config};
+use crate::{events::{Event, EventData, Identity}, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, EntityType, Player}, Config};
 
 pub struct HubManager {
     hubs: DashMap<Uuid, Arc<Hub>>,
@@ -15,16 +16,16 @@ pub struct HubManager {
 }
 impl HubManager {
 
-    pub fn new() -> HubManager {
-        HubManager { hubs: DashMap::new(), config: Config::get() }
+    pub async fn new() -> HubManager {
+        HubManager { hubs: DashMap::new(), config: Config::get().await }
     }
 
     fn find_hub(&self) -> Option<Arc<Hub>> {
         if self.hubs.len() == 0 {
             return None;
         }
-        let min_hub = self.hubs.iter().min_by_key(|h| h.players.len()).unwrap();
-        if min_hub.players.len() > min_hub.config.max_player_count as usize {
+        let min_hub = self.hubs.iter().min_by_key(|h| h.clients.len()).unwrap();
+        if min_hub.clients.len() > min_hub.config.max_player_count as usize {
             return None;
         }
         Some(min_hub.clone())
@@ -44,7 +45,7 @@ impl HubManager {
 }
 
 pub struct Hub {
-    players: DashMap<Uuid, Player>,
+    clients: DashMap<Uuid, broadcast::Sender<Message>>,
     entities: DashMap<Uuid, Arc<RwLock<Entity>>>,
     config: Config
 }
@@ -53,7 +54,7 @@ impl Hub {
 
     pub fn new(config: &Config) -> Hub {
          Hub {
-            players: DashMap::new(),
+            clients: DashMap::new(),
             entities: DashMap::new(),
             config: config.clone()
         }
@@ -69,8 +70,8 @@ impl Hub {
         let mut entity_data = entity.write().await;
         let old_coords = entity_data.coordinates.clone();
         entity_data.move_once();
-        if tiles.add(entity, entity_data.coordinates.clone(), entity_data.id) {
-            tiles.remove(entity_data.id, old_coords);
+        if tiles.add(entity, &entity_data.coordinates, entity_data.id) {
+            tiles.remove(entity_data.id, &old_coords);
         }
     } 
 
@@ -94,16 +95,16 @@ impl Hub {
     }
 
     pub fn dispatch_event<T: Serialize + ?Sized>(&self, event: &EventData<T>) {
-        let data = event.to_json().unwrap();
-        for player in self.players.iter() {
-            if let Err(_) = player.messages.send(data.clone()) {
+        let data = event.to_json();
+        for client in self.clients.iter() {
+            if let Err(_) = client.send(Message::Binary(data.clone())) {
                 warn!("Sent message to channel nobody was listening to");
             }
         }
     }
 
     pub fn kick_player(&self, id: Uuid) {
-        self.players.remove(&id);
+        self.clients.remove(&id);
         self.remove_entity(id);
     }
 
@@ -111,7 +112,7 @@ impl Hub {
         if let Some(_) = self.entities.remove(&id) {
             self.dispatch_event(&EventData {
                 event: Event::EntityDelete,
-                data: Identifiable {
+                data: Identity {
                     id
                 }
             });
@@ -120,33 +121,30 @@ impl Hub {
         }
     }
 
-    pub async fn spawn_entity(&self, entity: &Entity) -> Arc<RwLock<Entity>> {
+    pub async fn spawn_entity(&self, entity: Entity) -> Arc<RwLock<Entity>> {
         let entity_arc = Arc::new(RwLock::new(entity.clone()));
         self.entities.insert(entity.id, entity_arc.clone());
         self.dispatch_event(&EventData {
             event: Event::EntityCreate,
-            data: entity.clone()
+            data: entity
         });
         return entity_arc;
     }
 
     pub async fn spawn_player(self: &Arc<Self>, stream: WebSocketStream<TcpStream>) {
         let (mut ws_sender, ws_receiver) = stream.split();
-
-        let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
+        let (sender, mut receiver) = broadcast::channel::<Message>(16);
         let coords = Coordinates {
             x: self.random_coordinate(),
             y: self.random_coordinate()
         };
         let id = Uuid::new_v4();
-        let entity = self.spawn_entity(&Entity::new(coords, id)).await;
+        let entity = self.spawn_entity(
+            Entity::new(coords, id, &self.config, EntityType::Player(Player {points: 0, score: 0}))
+        ).await;
 
         tokio::spawn(listen_for_messages(entity.clone(), ws_receiver, self.clone()));
-
-        let player = Player {
-            messages: sender
-        };
-        self.players.insert(id, player);
+        self.clients.insert(id, sender);
         forward_messages_from_channel(
             &mut ws_sender, 
             &mut receiver
@@ -160,6 +158,7 @@ struct PlayerPositions {
     tiles: [[Tile; 10]; 10],
     scale: f64
 }
+
 impl PlayerPositions {
 
     fn new(scale: f64) -> Self {
@@ -169,11 +168,11 @@ impl PlayerPositions {
         }
     }
 
-    fn get(&mut self, coords: Coordinates) -> &mut Tile {
+    fn get(&mut self, coords: &Coordinates) -> &mut Tile {
         &mut self.tiles[coords.y as usize / self.scale as usize][coords.x as usize / self.scale as usize]
     }
 
-    fn add(&mut self, entity: &Arc<RwLock<Entity>>, coords: Coordinates, id: Uuid) -> bool {
+    fn add(&mut self, entity: &Arc<RwLock<Entity>>, coords: &Coordinates, id: Uuid) -> bool {
         let tile = self.get(coords);
         if let Some(entities) = tile {
             entities.insert(id, entity.clone()).is_none()
@@ -185,7 +184,7 @@ impl PlayerPositions {
         }
     }
 
-    fn remove(&mut self, id: Uuid, coords: Coordinates) {
+    fn remove(&mut self, id: Uuid, coords: &Coordinates) {
         let tile = self.get(coords);
         if let Some(entities) = tile {
             entities.remove(&id);
