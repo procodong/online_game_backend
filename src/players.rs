@@ -1,4 +1,4 @@
-use std::{array, ops::{Add, AddAssign}, sync::Arc};
+use std::{array, sync::Arc, usize};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -25,18 +25,18 @@ impl Coordinates {
     }
 
     pub fn min(&mut self, other: &Coordinates) -> &mut Self {
-        if self.x < other.x {
+        if self.x.abs() < other.x.abs() {
             self.x = other.x;
-        } if self.y < other.y {
+        } if self.y.abs() < other.y.abs() {
             self.y = other.y;
         }
         self
     }
 
     pub fn cap(&mut self, max: &Coordinates) -> &mut Self {
-        if self.x > max.x {
+        if self.x.abs() > max.x.abs() {
             self.x = max.x;
-        } if self.y > max.y {
+        } if self.y.abs() > max.y.abs() {
             self.y = max.y;
         }
         self
@@ -46,23 +46,6 @@ impl Coordinates {
         self.x += other.x;
         self.y += other.y;
         self
-    }
-}
-
-impl Add for Coordinates {
-    type Output = Coordinates;
-    fn add(self, rhs: Self) -> Self::Output {
-        Coordinates {
-            x: self.x + rhs.x,
-            y: self.y + rhs.y
-        }
-    }
-}
-
-impl AddAssign for Coordinates {
-    fn add_assign(&mut self, rhs: Self) {
-        self.x += rhs.x;
-        self.y += rhs.y;
     }
 }
 
@@ -97,16 +80,15 @@ pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<
             return;
         }
         let text = m.unwrap().into_data();
-        let event: Result<EventData<&RawValue>, _> = serde_json::from_slice(text.as_slice());
         let mut entity =  player.write().await;
-        if event.is_err() {
+        let Ok(event): Result<EventData<&RawValue>, _> = serde_json::from_slice(text.as_slice()) else {
             hub.kick_player(entity.id);
             return;
-        }
-        let event = event.unwrap();
-        let result: Result<(), ()> = match event.event {
+        };
+        let result = match event.event {
             Event::DirectionChange => entity.direction_change_event(serde_json::from_str(event.data.get()) , &hub),
             Event::YawChange => entity.yaw_change_event(serde_json::from_str(event.data.get()), &hub),
+            Event::ToggleShooting => Ok(entity.toggle_shooting()),
             _ => Err(())
         };
         if result.is_err() {
@@ -126,11 +108,11 @@ pub struct Entity {
     pub max_velocity: Coordinates,
     // Amount velocity is changed when moved
     pub acceleration: Coordinates,
-    pub size: f32,
     pub yaw: i32,
     pub tank: Arc<Tank>,
     pub levels: [u8; 8],
-    pub stats: EntityType
+    pub stats: EntityType,
+    shooting: bool
 }
 
 impl Entity {
@@ -142,23 +124,27 @@ impl Entity {
             velocity: Coordinates::empty(),
             max_velocity: Coordinates::empty(),
             acceleration: Coordinates::empty(),
-            size: 5.,
             yaw: 0,
             levels: array::from_fn(|_| 0),
             tank: config.tanks[0].clone(),
-            stats: inner
+            stats: inner,
+            shooting: false
         }
     }
 
-    pub fn level(&self, stat: Stat) -> u8 {
+    fn level(&self, stat: Stat) -> u8 {
         self.levels[stat as usize]
     }
 
-    pub fn stat_multiplier(&self, stat: Stat) -> f32 {
+    fn stat_multiplier(&self, stat: Stat) -> f32 {
         match stat {
             Stat::Reload => 1. - self.level(stat) as f32 / 20.,
             _ => 1. + self.level(stat) as f32 / 10.
         }
+    }
+
+    fn toggle_shooting(&mut self) {
+        self.shooting = !self.shooting;
     }
 
     fn base_stat(&self, stat: Stat) -> i32 {
@@ -184,11 +170,41 @@ impl Entity {
             return;
         }
         if let EntityType::Player(p) = &mut self.stats {
-            if p.points == 0 {
+            if p.points <= 0 {
                 return;
             }
             p.points -= 1;
             self.levels[stat as usize] += 1;
+        }
+    }
+
+    fn create_bullet(&self, cannon: &Cannon) -> Self {
+        let yaw = self.yaw + cannon.yaw;
+        let direction = yaw_coordinate_change(yaw);
+        let bullet = EntityType::Bullet(Bullet { author: self.id });
+        Entity {
+            id: Uuid::new_v4(),
+            coordinates: self.coordinates.clone(),
+            velocity: direction.clone(),
+            max_velocity: Coordinates { x: 0., y: 0. },
+            acceleration: Coordinates { x: direction.x / 10., y: direction.y / 10. },
+            yaw,
+            tank: cannon.bullet.clone(),
+            levels: array::from_fn(|i| {
+                match Stat::for_child(i) {
+                    Some(s) => self.level(s),
+                    _ => 0
+                }
+            }),
+            stats: bullet,
+            shooting: false
+        }
+    }
+
+    pub fn tick(&self, tick: u32, hub: &Arc<Hub>) {
+        for cannon in self.active_cannons(tick) {
+            let entity = self.create_bullet(cannon);
+            hub.spawn_entity(entity);
         }
     }
 
@@ -200,8 +216,8 @@ impl Entity {
     fn direction_change_event(&mut self, direction: serde_json::Result<DirectionChange>, hub: &Arc<Hub>) -> Result<(), ()> {
         let Ok(direction) = direction else {return Err(());};
         self.change_direction(direction);
-        hub.dispatch_event(&EventData {
-            event: Event::MotionUpdate,
+        hub.dispatch_event(EventData {
+            event: Event::EntityUpdate,
             data: &self
         });
         Ok(())
@@ -223,8 +239,8 @@ impl Entity {
     fn yaw_change_event(&mut self, yaw_update: serde_json::Result<YawChange>, hub: &Arc<Hub>) -> Result<(), ()> {
         let Ok(yaw_update_data) = yaw_update else {return Err(());};
         self.change_yaw(yaw_update_data);
-        hub.dispatch_event(&EventData {
-            event: Event::MotionUpdate,
+        hub.dispatch_event(EventData {
+            event: Event::EntityUpdate,
             data: &self
         });
         Ok(())
@@ -250,11 +266,23 @@ pub enum Stat {
     MovementSpeed = 7
 }
 
+impl Stat {
+    fn for_child(value: usize) -> Option<Self> {
+        match value {
+            5 /*bulled damage */ => Some(Self::BodyDamage),
+            4 /*bullet penetration */ => Some(Self::MaxHealth),
+            3 /*bullet speed */ => Some(Self::MovementSpeed),
+            _ => None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Cannon {
     pub yaw: i32,
     pub delay: i32,
-    pub size: i32
+    pub size: i32,
+    pub bullet: Arc<Tank>
 }
 
 #[derive(Debug, Clone, Deserialize)]

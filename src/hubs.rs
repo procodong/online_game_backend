@@ -87,6 +87,8 @@ impl Hub {
         loop {
             interval.tick().await;
             self.update_all_entities(&mut tiles).await;
+            // TODO: tick each entity to shoot
+            // TODO: Maybe queue entity updates to be done each tick
         }
     }
 
@@ -94,8 +96,12 @@ impl Hub {
         rand::thread_rng().gen_range(0..self.config.map_size as i32) as f64
     }
 
-    pub fn dispatch_event<T: Serialize + ?Sized>(&self, event: &EventData<T>) {
-        let data = event.to_json();
+    pub fn dispatch_event<T: Serialize>(&self, event: EventData<T>) {
+        self.dispatch_events(vec![event]);  // TODO: Queue messages to be sent each tick
+    }
+
+    pub fn dispatch_events<T: Serialize>(&self, events: Vec<EventData<T>>) {
+        let data = serde_json::to_vec(&events).unwrap();
         for client in self.clients.iter() {
             if let Err(_) = client.send(Message::Binary(data.clone())) {
                 warn!("Sent message to channel nobody was listening to");
@@ -110,7 +116,7 @@ impl Hub {
 
     pub fn remove_entity(&self, id: Uuid) {
         if let Some(_) = self.entities.remove(&id) {
-            self.dispatch_event(&EventData {
+            self.dispatch_event(EventData {
                 event: Event::EntityDelete,
                 data: Identity {
                     id
@@ -121,14 +127,15 @@ impl Hub {
         }
     }
 
-    pub async fn spawn_entity(&self, entity: Entity) -> Arc<RwLock<Entity>> {
-        let entity_arc = Arc::new(RwLock::new(entity.clone()));
-        self.entities.insert(entity.id, entity_arc.clone());
-        self.dispatch_event(&EventData {
-            event: Event::EntityCreate,
-            data: entity
+    pub fn spawn_entity(&self, entity: Entity) -> Arc<RwLock<Entity>> {
+        let id = entity.id.clone();
+        self.dispatch_event(EventData {
+            event: Event::EntityUpdate,
+            data: &entity
         });
-        return entity_arc;
+        let entity_arc = Arc::new(RwLock::new(entity));
+        self.entities.insert(id, entity_arc.clone());
+        entity_arc
     }
 
     pub async fn spawn_player(self: &Arc<Self>, stream: WebSocketStream<TcpStream>) {
@@ -139,9 +146,8 @@ impl Hub {
             y: self.random_coordinate()
         };
         let id = Uuid::new_v4();
-        let entity = self.spawn_entity(
-            Entity::new(coords, id, &self.config, EntityType::Player(Player {points: 0, score: 0}))
-        ).await;
+        let entity_data = Entity::new(coords, id, &self.config, EntityType::Player(Player {points: 0, score: 0}));
+        let entity = self.spawn_entity(entity_data);
 
         tokio::spawn(listen_for_messages(entity.clone(), ws_receiver, self.clone()));
         self.clients.insert(id, sender);

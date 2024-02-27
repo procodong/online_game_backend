@@ -16,12 +16,12 @@ impl<T: ?Sized + Serialize> EventData<T> {
 
 #[derive(Serialize, Deserialize)]
 pub enum Event {
-    EntityCreate = 0,
-    EntityDelete = 1,
-    DirectionChange = 2,
-    YawChange = 3,
-    MotionUpdate = 4,
-    ToggleShooting= 5
+    EntityDelete = 0,
+    DirectionChange = 1,
+    YawChange = 2,
+    EntityUpdate = 3,
+    ToggleShooting = 4,
+    LevelUpgrade = 5
 }
 
 #[derive(Serialize, Deserialize)]
