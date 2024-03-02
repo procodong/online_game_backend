@@ -2,17 +2,14 @@ use serde::{Deserialize, Serialize};
 use serde;
 use uuid::Uuid;
 
+use crate::players::{Coordinates, Stat};
+
 #[derive(Deserialize, Serialize)]
 pub struct EventData<T: ?Sized + Serialize> {
     pub event: Event,
     pub data: T
 }
-impl<T: ?Sized + Serialize> EventData<T> {
 
-    pub fn to_json(&self) -> Vec<u8> {
-        serde_json::to_vec(self).unwrap()
-    }
-}
 
 #[derive(Serialize, Deserialize)]
 pub enum Event {
@@ -24,7 +21,24 @@ pub enum Event {
     LevelUpgrade = 5
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
+pub enum UserEvent {
+    SetShooting(bool),
+    Yaw(i32),
+    LevelUpgrade(Stat),
+    DirectionChange(DirectionChange)
+}
+
+#[derive(Serialize)]
+pub enum ServerEvent {
+    EntityDelete(Uuid),
+    EntityCreate {id: Uuid, tank: i32, position: Coordinates},
+    Yaw {user: Uuid, yaw: i32},
+    Position {user: Uuid, coordinates: Coordinates},
+    TankUpgrade {user: Uuid, tank: i32},
+}
+
+#[derive(Deserialize)]
 pub struct DirectionChange {
     pub up: bool,
     pub left: bool,
@@ -32,9 +46,13 @@ pub struct DirectionChange {
     pub right: bool
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct YawChange {
-    pub yaw: i32
+impl DirectionChange {
+    pub fn to_velocity(&self) -> Coordinates {
+        Coordinates {
+            x: self.right as i32 as f64 - self.left as i32 as f64,
+            y: self.down as i32 as f64 - self.up as i32 as f64
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

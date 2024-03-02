@@ -2,13 +2,12 @@ use std::{array, sync::Arc, usize};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use tokio::{net::TcpStream, sync::{broadcast, RwLock}};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 use uuid::Uuid;
 
-use crate::{events::{DirectionChange, Event, EventData, YawChange}, hubs::Hub, Config};
+use crate::{events::{DirectionChange, Event, EventData, UserEvent}, hubs::Hub, Config};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Coordinates {
@@ -75,23 +74,12 @@ pub async fn forward_messages_from_channel(
 
 pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<WebSocketStream<TcpStream>>, hub: Arc<Hub>) {
     read.try_filter(|msg| future::ready(msg.is_text()))
-    .for_each(|m| async {
-        if m.is_err() {
+    .for_each(|msg| async {
+        if msg.is_err() {
             return;
         }
-        let text = m.unwrap().into_data();
-        let mut entity =  player.write().await;
-        let Ok(event): Result<EventData<&RawValue>, _> = serde_json::from_slice(text.as_slice()) else {
-            hub.kick_player(entity.id);
-            return;
-        };
-        let result = match event.event {
-            Event::DirectionChange => entity.direction_change_event(serde_json::from_str(event.data.get()) , &hub),
-            Event::YawChange => entity.yaw_change_event(serde_json::from_str(event.data.get()), &hub),
-            Event::ToggleShooting => Ok(entity.toggle_shooting()),
-            _ => Err(())
-        };
-        if result.is_err() {
+        let mut entity = player.write().await;
+        if entity.handle_event(msg.unwrap(), &hub).is_err() {
             hub.kick_player(entity.id);
         }
     }).await;
@@ -141,10 +129,6 @@ impl Entity {
             Stat::Reload => 1. - self.level(stat) as f32 / 20.,
             _ => 1. + self.level(stat) as f32 / 10.
         }
-    }
-
-    fn toggle_shooting(&mut self) {
-        self.shooting = !self.shooting;
     }
 
     fn base_stat(&self, stat: Stat) -> i32 {
@@ -213,48 +197,51 @@ impl Entity {
         self.velocity.combine(&self.acceleration).cap(&self.max_velocity);
     }
 
-    fn direction_change_event(&mut self, direction: serde_json::Result<DirectionChange>, hub: &Arc<Hub>) -> Result<(), ()> {
-        let Ok(direction) = direction else {return Err(());};
+    fn direction_change_event(&mut self, direction: DirectionChange, hub: &Arc<Hub>) {
         self.change_direction(direction);
         hub.dispatch_event(EventData {
             event: Event::EntityUpdate,
             data: &self
         });
+    }
+
+    fn handle_event(&mut self, message: Message, hub: &Arc<Hub>) -> Result<(), ()> {
+        let Ok(event) = bincode::deserialize(message.into_data().as_slice()) else {
+            return Err(());
+        };
+        match event {
+            UserEvent::DirectionChange(d) => self.direction_change_event(d, &hub),
+            UserEvent::Yaw(yaw) => self.yaw_change_event(yaw, &hub),
+            UserEvent::SetShooting(shooting) => self.shooting = shooting,
+            UserEvent::LevelUpgrade(stat) => self.increment_level(stat)
+        };
         Ok(())
     }
 
     pub fn change_direction(&mut self, direction: DirectionChange) {
-        let x_mod = direction.down as i32 - direction.up as i32; 
-        let y_mod = direction.right as i32 - direction.left as i32;
+        let velocity = direction.to_velocity();
+        let acceleration_x = velocity.x / 10.;
+        let acceleration_y = velocity.y / 10.;
         self.acceleration = Coordinates {
-            x: x_mod as f64 / 10.,
-            y: y_mod as f64 / 10.
+            x: if acceleration_x != 0. {acceleration_x} else {-self.max_velocity.x / 10.},
+            y: if acceleration_y != 0. {acceleration_y} else {-self.max_velocity.y / 10.}
         };
-        self.max_velocity = Coordinates {
-            x: x_mod as f64,
-            y: y_mod as f64
-        };
+        self.max_velocity = velocity;
     }
 
-    fn yaw_change_event(&mut self, yaw_update: serde_json::Result<YawChange>, hub: &Arc<Hub>) -> Result<(), ()> {
-        let Ok(yaw_update_data) = yaw_update else {return Err(());};
-        self.change_yaw(yaw_update_data);
+    fn yaw_change_event(&mut self, yaw: i32, hub: &Arc<Hub>) {
+        if yaw == self.yaw {
+            return;
+        }
+        self.yaw = yaw;
         hub.dispatch_event(EventData {
             event: Event::EntityUpdate,
             data: &self
         });
-        Ok(())
-    }
-    
-    fn change_yaw(&mut self, yaw_update: YawChange) {
-        if yaw_update.yaw == self.yaw {
-            return;
-        }
-        self.yaw = yaw_update.yaw;
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Deserialize)]
 pub enum Stat {
     HealthRegen = 0,
     MaxHealth = 1,

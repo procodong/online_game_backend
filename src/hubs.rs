@@ -8,7 +8,7 @@ use tokio::{net::TcpStream, sync::{broadcast, RwLock}, time};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
 use uuid::Uuid;
-use crate::{events::{Event, EventData, Identity}, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, EntityType, Player}, Config};
+use crate::{events::{Event, EventData, Identity, ServerEvent}, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, EntityType, Player}, Config};
 
 pub struct HubManager {
     hubs: DashMap<Uuid, Arc<Hub>>,
@@ -88,7 +88,6 @@ impl Hub {
             interval.tick().await;
             self.update_all_entities(&mut tiles).await;
             // TODO: tick each entity to shoot
-            // TODO: Maybe queue entity updates to be done each tick
         }
     }
 
@@ -96,11 +95,11 @@ impl Hub {
         rand::thread_rng().gen_range(0..self.config.map_size as i32) as f64
     }
 
-    pub fn dispatch_event<T: Serialize>(&self, event: EventData<T>) {
-        self.dispatch_events(vec![event]);  // TODO: Queue messages to be sent each tick
+    pub fn dispatch_event(&self, event: ServerEvent) {
+        self.dispatch_events(vec![event]);
     }
 
-    pub fn dispatch_events<T: Serialize>(&self, events: Vec<EventData<T>>) {
+    pub fn dispatch_events(&self, events: Vec<ServerEvent>) {
         let data = serde_json::to_vec(&events).unwrap();
         for client in self.clients.iter() {
             if let Err(_) = client.send(Message::Binary(data.clone())) {
@@ -115,25 +114,19 @@ impl Hub {
     }
 
     pub fn remove_entity(&self, id: Uuid) {
-        if let Some(_) = self.entities.remove(&id) {
-            self.dispatch_event(EventData {
-                event: Event::EntityDelete,
-                data: Identity {
-                    id
-                }
-            });
-        } else {
+        if self.entities.remove(&id).is_none() {
             warn!("Tried removing an entity that does not exist: {}", id);
+            return;
         }
+        self.dispatch_event(ServerEvent::EntityDelete(id));
     }
 
-    pub fn spawn_entity(&self, entity: Entity) -> Arc<RwLock<Entity>> {
+    pub async fn spawn_entity(&self, entity: Entity) -> Arc<RwLock<Entity>> {
         let id = entity.id.clone();
-        self.dispatch_event(EventData {
-            event: Event::EntityUpdate,
-            data: &entity
-        });
         let entity_arc = Arc::new(RwLock::new(entity));
+        let ent = entity_arc.clone();
+        let data = ent.read().await;
+        self.dispatch_event(ServerEvent::EntityCreate { id, tank: data.tank.id, position: data.coordinates.clone() });
         self.entities.insert(id, entity_arc.clone());
         entity_arc
     }
@@ -146,15 +139,16 @@ impl Hub {
             y: self.random_coordinate()
         };
         let id = Uuid::new_v4();
-        let entity_data = Entity::new(coords, id, &self.config, EntityType::Player(Player {points: 0, score: 0}));
-        let entity = self.spawn_entity(entity_data);
+        let entity_data = Entity::new(coords, id, &self.config, EntityType::Player(Player { points: 0, score: 0 }));
+        let entity = self.spawn_entity(entity_data).await;
 
         tokio::spawn(listen_for_messages(entity.clone(), ws_receiver, self.clone()));
-        self.clients.insert(id, sender);
+        
         forward_messages_from_channel(
             &mut ws_sender, 
             &mut receiver
         ).await;
+        self.clients.insert(id, sender);
     }
 }
 
@@ -169,7 +163,7 @@ impl PlayerPositions {
 
     fn new(scale: f64) -> Self {
         Self {
-            tiles: array::from_fn(|_|  array::from_fn(|_| None)),
+            tiles: array::from_fn(|_| array::from_fn(|_| None)),
             scale
         }
     }
