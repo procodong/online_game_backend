@@ -192,6 +192,7 @@ impl Entity {
         for cannon in self.active_cannons(*tick) {
             let entity = self.create_bullet(cannon);
             events.push(ServerEvent::EntityCreate { id: entity.id, tank: entity.tank.id, position: entity.coordinates });
+            // Spawn the dang entity
         }
         if self.yaw != self.target_yaw {
             self.update_yaw();
@@ -222,17 +223,10 @@ impl Entity {
         self.max_velocity = velocity;
     }
 
-    fn change_yaw(&mut self, yaw: i32) {
-        if yaw == self.target_yaw {
-            return;
-        }
-        self.target_yaw = yaw;
-    }
-
     fn handle_event(&mut self, event: UserEvent) {
         match event {
             UserEvent::DirectionChange(d) => self.change_direction(d),
-            UserEvent::Yaw(yaw) => self.change_yaw(yaw),
+            UserEvent::Yaw(yaw) => self.target_yaw = yaw,
             UserEvent::SetShooting(shooting) => self.shooting = shooting,
             UserEvent::LevelUpgrade(stat) => self.increment_level(stat)
         };

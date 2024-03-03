@@ -4,22 +4,6 @@ use serde;
 use crate::hubs::Id;
 use crate::players::{Coordinates, Stat};
 
-#[derive(Deserialize, Serialize)]
-pub struct EventData<T: ?Sized + Serialize> {
-    pub event: Event,
-    pub data: T
-}
-
-
-#[derive(Serialize, Deserialize)]
-pub enum Event {
-    EntityDelete = 0,
-    DirectionChange = 1,
-    YawChange = 2,
-    EntityUpdate = 3,
-    ToggleShooting = 4,
-    LevelUpgrade = 5
-}
 
 #[derive(Deserialize)]
 pub enum UserEvent {

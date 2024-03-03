@@ -111,7 +111,7 @@ impl Hub {
         let data = bincode::serialize(&events).unwrap();
         for client in self.clients.iter() {
             if let Err(_) = client.send(Message::Binary(data.clone())) {
-                warn!("Sent message to channel nobody was listening to");
+                warn!("Sent message to a client that isn't receiving messages");
             }
         }
     }
