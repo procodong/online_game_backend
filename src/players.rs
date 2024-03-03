@@ -1,13 +1,12 @@
-use std::{array, sync::Arc, usize};
+use std::{array, sync::{atomic::Ordering, Arc}, usize};
 use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpStream, sync::{broadcast, RwLock}};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
-use uuid::Uuid;
 
-use crate::{events::{DirectionChange, Event, EventData, UserEvent}, hubs::Hub, Config};
+use crate::{events::{DirectionChange, ServerEvent, UserEvent}, hubs::{Hub, Id, ID_COUNTER}, Config};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Coordinates {
@@ -79,15 +78,18 @@ pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<
             return;
         }
         let mut entity = player.write().await;
-        if entity.handle_event(msg.unwrap(), &hub).is_err() {
+        
+        let Ok(event) = bincode::deserialize(msg.unwrap().into_data().as_slice()) else {
             hub.kick_player(entity.id);
-        }
+            return;
+        };
+        entity.handle_event(event);
     }).await;
 }
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Entity {
-    pub id: Uuid,
+    pub id: Id,
     // Position in the map
     pub coordinates: Coordinates,
     // Amount coordinates is changed when moved
@@ -96,6 +98,7 @@ pub struct Entity {
     pub max_velocity: Coordinates,
     // Amount velocity is changed when moved
     pub acceleration: Coordinates,
+    pub target_yaw: i32,
     pub yaw: i32,
     pub tank: Arc<Tank>,
     pub levels: [u8; 8],
@@ -105,7 +108,7 @@ pub struct Entity {
 
 impl Entity {
 
-    pub fn new(coords: Coordinates, id: Uuid, config: &Config, inner: EntityType) -> Self {
+    pub fn new(coords: Coordinates, id: Id, config: &Config, inner: EntityType) -> Self {
         Self {
             id,
             coordinates: coords,
@@ -113,6 +116,7 @@ impl Entity {
             max_velocity: Coordinates::empty(),
             acceleration: Coordinates::empty(),
             yaw: 0,
+            target_yaw: 0,
             levels: array::from_fn(|_| 0),
             tank: config.tanks[0].clone(),
             stats: inner,
@@ -146,8 +150,6 @@ impl Entity {
 
     const MAX_LEVEL: u8 = 10;
 
-    // This function shouldn't be accessible for a non-player entity
-    // Oh well!
     pub fn increment_level(&mut self, stat: Stat) {
         let current_level = self.level(stat.clone());
         if current_level + 1 >= Self::MAX_LEVEL {
@@ -167,12 +169,13 @@ impl Entity {
         let direction = yaw_coordinate_change(yaw);
         let bullet = EntityType::Bullet(Bullet { author: self.id });
         Entity {
-            id: Uuid::new_v4(),
+            id: ID_COUNTER.fetch_add(1, Ordering::SeqCst),
             coordinates: self.coordinates.clone(),
             velocity: direction.clone(),
             max_velocity: Coordinates { x: 0., y: 0. },
             acceleration: Coordinates { x: direction.x / 10., y: direction.y / 10. },
             yaw,
+            target_yaw: yaw,
             tank: cannon.bullet.clone(),
             levels: array::from_fn(|i| {
                 match Stat::for_child(i) {
@@ -185,10 +188,21 @@ impl Entity {
         }
     }
 
-    pub fn tick(&self, tick: u32, hub: &Arc<Hub>) {
-        for cannon in self.active_cannons(tick) {
+    pub fn tick(&mut self, tick: &u32, events: &mut Vec<ServerEvent>) {
+        for cannon in self.active_cannons(*tick) {
             let entity = self.create_bullet(cannon);
-            hub.spawn_entity(entity);
+            events.push(ServerEvent::EntityCreate { id: entity.id, tank: entity.tank.id, position: entity.coordinates });
+        }
+        if self.yaw != self.target_yaw {
+            self.update_yaw();
+        }
+    }
+
+    fn update_yaw(&mut self) {
+        if self.yaw < self.target_yaw {
+            self.yaw += 1;
+        } else {
+            self.yaw -= 1;
         }
     }
 
@@ -197,28 +211,7 @@ impl Entity {
         self.velocity.combine(&self.acceleration).cap(&self.max_velocity);
     }
 
-    fn direction_change_event(&mut self, direction: DirectionChange, hub: &Arc<Hub>) {
-        self.change_direction(direction);
-        hub.dispatch_event(EventData {
-            event: Event::EntityUpdate,
-            data: &self
-        });
-    }
-
-    fn handle_event(&mut self, message: Message, hub: &Arc<Hub>) -> Result<(), ()> {
-        let Ok(event) = bincode::deserialize(message.into_data().as_slice()) else {
-            return Err(());
-        };
-        match event {
-            UserEvent::DirectionChange(d) => self.direction_change_event(d, &hub),
-            UserEvent::Yaw(yaw) => self.yaw_change_event(yaw, &hub),
-            UserEvent::SetShooting(shooting) => self.shooting = shooting,
-            UserEvent::LevelUpgrade(stat) => self.increment_level(stat)
-        };
-        Ok(())
-    }
-
-    pub fn change_direction(&mut self, direction: DirectionChange) {
+    fn change_direction(&mut self, direction: DirectionChange) {
         let velocity = direction.to_velocity();
         let acceleration_x = velocity.x / 10.;
         let acceleration_y = velocity.y / 10.;
@@ -229,15 +222,20 @@ impl Entity {
         self.max_velocity = velocity;
     }
 
-    fn yaw_change_event(&mut self, yaw: i32, hub: &Arc<Hub>) {
-        if yaw == self.yaw {
+    fn change_yaw(&mut self, yaw: i32) {
+        if yaw == self.target_yaw {
             return;
         }
-        self.yaw = yaw;
-        hub.dispatch_event(EventData {
-            event: Event::EntityUpdate,
-            data: &self
-        });
+        self.target_yaw = yaw;
+    }
+
+    fn handle_event(&mut self, event: UserEvent) {
+        match event {
+            UserEvent::DirectionChange(d) => self.change_direction(d),
+            UserEvent::Yaw(yaw) => self.change_yaw(yaw),
+            UserEvent::SetShooting(shooting) => self.shooting = shooting,
+            UserEvent::LevelUpgrade(stat) => self.increment_level(stat)
+        };
     }
 }
 
@@ -300,5 +298,5 @@ pub struct Player {
 
 #[derive(Debug, Serialize, Clone)]
 pub struct Bullet {
-    pub author: Uuid
+    pub author: Id
 }

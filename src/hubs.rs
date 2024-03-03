@@ -1,19 +1,22 @@
-use std::{array, collections::HashMap, sync::Arc, time::Duration};
+use std::{array, collections::HashSet, sync::{atomic::{AtomicI32, Ordering}, Arc}, time::Duration};
 use dashmap::DashMap;
 use futures_util::StreamExt;
 use log::warn;
 use rand::Rng;
-use serde::Serialize;
 use tokio::{net::TcpStream, sync::{broadcast, RwLock}, time};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
-use uuid::Uuid;
-use crate::{events::{Event, EventData, Identity, ServerEvent}, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, EntityType, Player}, Config};
+use crate::{events::ServerEvent, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, EntityType, Player}, Config};
+
+pub static ID_COUNTER: AtomicI32 = AtomicI32::new(0);
+
+pub type Id = i32;
 
 pub struct HubManager {
-    hubs: DashMap<Uuid, Arc<Hub>>,
+    hubs: DashMap<Id, Arc<Hub>>,
     config: Config
 }
+
 impl HubManager {
 
     pub async fn new() -> HubManager {
@@ -34,7 +37,7 @@ impl HubManager {
     fn create_hub(&self) -> Arc<Hub> {
         let new_hub = Arc::new(Hub::new(&self.config));
         new_hub.clone().start();
-        self.hubs.insert(Uuid::new_v4(), new_hub.clone());
+        self.hubs.insert(ID_COUNTER.fetch_add(1, Ordering::SeqCst), new_hub.clone());
         new_hub
     }
 
@@ -45,8 +48,8 @@ impl HubManager {
 }
 
 pub struct Hub {
-    clients: DashMap<Uuid, broadcast::Sender<Message>>,
-    entities: DashMap<Uuid, Arc<RwLock<Entity>>>,
+    clients: DashMap<Id, broadcast::Sender<Message>>,
+    entities: DashMap<Id, Arc<RwLock<Entity>>>,
     config: Config
 }
 
@@ -66,28 +69,33 @@ impl Hub {
         });
     }
     
-    async fn move_entity(&self, entity: &Arc<RwLock<Entity>>, tiles: &mut PlayerPositions) {
+    async fn update_entity(&self, entity: &Arc<RwLock<Entity>>, tiles: &mut PlayerPositions, tick: &u32, events: &mut Vec<ServerEvent>) {
         let mut entity_data = entity.write().await;
         let old_coords = entity_data.coordinates.clone();
         entity_data.move_once();
-        if tiles.add(entity, &entity_data.coordinates, entity_data.id) {
+        if tiles.add(&entity_data.coordinates, entity_data.id) {
             tiles.remove(entity_data.id, &old_coords);
         }
+        entity_data.tick(tick, events);
+        events.push(ServerEvent::Position { user: entity_data.id, coordinates: entity_data.coordinates.clone() });
     } 
 
-    async fn update_all_entities(&self, tiles: &mut PlayerPositions) {
+    async fn update_all_entities(&self, tiles: &mut PlayerPositions, tick: &u32, events: &mut Vec<ServerEvent>) {
         for entity in self.entities.iter() {
-            self.move_entity(entity.value(), tiles).await;
+            self.update_entity(entity.value(), tiles, tick, events).await;
         }
     } 
 
     async fn game_update_loop(&self) {
         let mut tiles = PlayerPositions::new(self.config.map_size / 10.);
         let mut interval = time::interval(Duration::from_millis(self.config.update_delay_ms));
+        let mut tick = 0u32;
         loop {
             interval.tick().await;
-            self.update_all_entities(&mut tiles).await;
-            // TODO: tick each entity to shoot
+            let mut events = Vec::new();
+            self.update_all_entities(&mut tiles, &tick, &mut events).await;
+            self.dispatch_events(events);
+            tick += 1;
         }
     }
 
@@ -100,7 +108,7 @@ impl Hub {
     }
 
     pub fn dispatch_events(&self, events: Vec<ServerEvent>) {
-        let data = serde_json::to_vec(&events).unwrap();
+        let data = bincode::serialize(&events).unwrap();
         for client in self.clients.iter() {
             if let Err(_) = client.send(Message::Binary(data.clone())) {
                 warn!("Sent message to channel nobody was listening to");
@@ -108,12 +116,12 @@ impl Hub {
         }
     }
 
-    pub fn kick_player(&self, id: Uuid) {
+    pub fn kick_player(&self, id: Id) {
         self.clients.remove(&id);
         self.remove_entity(id);
     }
 
-    pub fn remove_entity(&self, id: Uuid) {
+    pub fn remove_entity(&self, id: Id) {
         if self.entities.remove(&id).is_none() {
             warn!("Tried removing an entity that does not exist: {}", id);
             return;
@@ -138,7 +146,7 @@ impl Hub {
             x: self.random_coordinate(),
             y: self.random_coordinate()
         };
-        let id = Uuid::new_v4();
+        let id = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
         let entity_data = Entity::new(coords, id, &self.config, EntityType::Player(Player { points: 0, score: 0 }));
         let entity = self.spawn_entity(entity_data).await;
 
@@ -152,7 +160,7 @@ impl Hub {
     }
 }
 
-type Tile = Option<HashMap<Uuid, Arc<RwLock<Entity>>>>;
+type Tile = Option<HashSet<Id>>;
 
 struct PlayerPositions {
     tiles: [[Tile; 10]; 10],
@@ -172,19 +180,19 @@ impl PlayerPositions {
         &mut self.tiles[coords.y as usize / self.scale as usize][coords.x as usize / self.scale as usize]
     }
 
-    fn add(&mut self, entity: &Arc<RwLock<Entity>>, coords: &Coordinates, id: Uuid) -> bool {
+    fn add(&mut self, coords: &Coordinates, id: Id) -> bool {
         let tile = self.get(coords);
         if let Some(entities) = tile {
-            entities.insert(id, entity.clone()).is_none()
+            entities.insert(id)
         } else {
-            let mut values = HashMap::new();
-            values.insert(id, entity.clone());
+            let mut values = HashSet::new();
+            values.insert(id);
             *tile = Some(values);
             true
         }
     }
 
-    fn remove(&mut self, id: Uuid, coords: &Coordinates) {
+    fn remove(&mut self, id: Id, coords: &Coordinates) {
         let tile = self.get(coords);
         if let Some(entities) = tile {
             entities.remove(&id);

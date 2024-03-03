@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde;
-use uuid::Uuid;
 
+use crate::hubs::Id;
 use crate::players::{Coordinates, Stat};
 
 #[derive(Deserialize, Serialize)]
@@ -29,13 +29,13 @@ pub enum UserEvent {
     DirectionChange(DirectionChange)
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub enum ServerEvent {
-    EntityDelete(Uuid),
-    EntityCreate {id: Uuid, tank: i32, position: Coordinates},
-    Yaw {user: Uuid, yaw: i32},
-    Position {user: Uuid, coordinates: Coordinates},
-    TankUpgrade {user: Uuid, tank: i32},
+    EntityDelete(Id),
+    EntityCreate {id: Id, tank: i32, position: Coordinates},
+    Yaw {user: Id, yaw: i32},
+    Position {user: Id, coordinates: Coordinates},
+    TankUpgrade {user: Id, tank: i32},
 }
 
 #[derive(Deserialize)]
@@ -53,9 +53,4 @@ impl DirectionChange {
             y: self.down as i32 as f64 - self.up as i32 as f64
         }
     }
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct Identity {
-    pub id: Uuid
 }
