@@ -22,17 +22,6 @@ impl HubManager {
         HubManager { hubs: DashMap::new(), config: Config::get().await }
     }
 
-    fn find_hub(&self) -> Option<HubPlayers> {
-        if self.hubs.len() == 0 {
-            return None;
-        }
-        let min_hub = self.hubs.iter_mut().min_by_key(|h| h.player_count).unwrap();
-        if min_hub.player_count > self.config.max_player_count {
-            return None;
-        }
-        Some(min_hub.clone())
-    }
-
     async fn create_hub(&self, stream: WebSocketStream<TcpStream>) {
         let mut new_hub = Hub::new(&self.config);
         let (user_adder, user_receiver) = mpsc::channel(1);
@@ -44,8 +33,8 @@ impl HubManager {
     }
 
     pub async fn create_client(&self, stream: WebSocketStream<TcpStream>) {
-        match self.find_hub() {
-            Some(hub) => {
+        match self.hubs.iter().min_by_key(|h| h.player_count) {
+            Some(hub) if hub.player_count < self.config.max_player_count => {
                 if hub.adder.send(stream).await.is_err() {
                     warn!("Tried to add a player to a hub that has ended");
 
@@ -56,7 +45,7 @@ impl HubManager {
     }
 }
 
-#[derive(Debug, Clone)]
+
 struct HubPlayers {
     adder: mpsc::Sender<WebSocketStream<TcpStream>>,
     player_count: i32

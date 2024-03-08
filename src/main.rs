@@ -25,10 +25,9 @@ async fn main() -> Result<(), Error> {
 }
 
 async fn accept_connection(stream: TcpStream, hubs: &HubManager) {
-    let addr = stream.peer_addr().expect("connected streams should have a peer address");
-    let ws_stream = tokio_tungstenite::accept_async(stream).await.expect("Error during the websocket handshake occurred");
-    info!("New WebSocket connection: {}", addr);
-    hubs.create_client(ws_stream).await
+    if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+        hubs.create_client(ws_stream).await
+    }
 }
 
 #[derive(Clone, Deserialize)]
