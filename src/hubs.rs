@@ -1,4 +1,4 @@
-use std::{array, collections::{HashMap, HashSet}, sync::{atomic::{AtomicI32, Ordering}, Arc}, time::Duration};
+use std::{array, collections::{HashMap, HashSet}, sync::atomic::{AtomicI32, Ordering}, time::Duration};
 use dashmap::DashMap;
 use log::warn;
 use rand::Rng;
@@ -38,10 +38,12 @@ impl HubManager {
         let (user_adder, user_receiver) = mpsc::channel(1);
         let _ = user_adder.send(stream).await;
         self.hubs.insert(ID_COUNTER.fetch_add(1, Ordering::SeqCst), HubPlayers { adder: user_adder, player_count: 0 });
-        new_hub.game_update_loop(user_receiver).await;
+        tokio::spawn(async move {
+            new_hub.game_update_loop(user_receiver).await;
+        });
     }
 
-    pub async fn create_client(self: Arc<Self>, stream: WebSocketStream<TcpStream>) {
+    pub async fn create_client(&self, stream: WebSocketStream<TcpStream>) {
         match self.find_hub() {
             Some(hub) => {
                 if hub.adder.send(stream).await.is_err() {
@@ -49,9 +51,7 @@ impl HubManager {
 
                 }
             },
-            _ => {tokio::spawn(async move {
-                self.create_hub(stream).await;
-            });}
+            _ => self.create_hub(stream).await
         };
     }
 }

@@ -1,7 +1,6 @@
 mod hubs;
 pub mod players;
 mod events;
-mod tests;
 
 use std::{env, fmt::Debug, io::Error, path::Path, str::FromStr, sync::Arc};
 use players::Tank;
@@ -15,17 +14,17 @@ use crate::hubs::HubManager;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let _ = env_logger::try_init();
-    let hubs = Arc::new(HubManager::new().await);
+    let hubs = HubManager::new().await;
     let listener = TcpListener::bind(&"127.0.0.1:8080".to_string()).await.expect("Failed to bind");
     info!("Listening on: http://localhost:8080/");
     while let Ok((stream, _)) = listener.accept().await {
-        accept_connection(stream, hubs.clone()).await;
+        accept_connection(stream, &hubs).await;
     }
 
     Ok(())
 }
 
-async fn accept_connection(stream: TcpStream, hubs: Arc<HubManager>) {
+async fn accept_connection(stream: TcpStream, hubs: &HubManager) {
     let addr = stream.peer_addr().expect("connected streams should have a peer address");
     let ws_stream = tokio_tungstenite::accept_async(stream).await.expect("Error during the websocket handshake occurred");
     info!("New WebSocket connection: {}", addr);
