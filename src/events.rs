@@ -5,7 +5,8 @@ use crate::hubs::Id;
 use crate::players::{Coordinates, Stat};
 
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
+#[serde(tag = "event")]
 pub enum UserEvent {
     SetShooting(bool),
     Yaw(i32),
@@ -13,7 +14,13 @@ pub enum UserEvent {
     DirectionChange(DirectionChange)
 }
 
+pub struct UserEventMessage {
+    pub event: UserEvent,
+    pub user: Id
+}
+
 #[derive(Serialize, Clone)]
+#[serde(tag = "event")]
 pub enum ServerEvent {
     EntityDelete(Id),
     EntityCreate {id: Id, tank: i32, position: Coordinates},
@@ -22,7 +29,7 @@ pub enum ServerEvent {
     TankUpgrade {user: Id, tank: i32},
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct DirectionChange {
     pub up: bool,
     pub left: bool,

@@ -19,7 +19,7 @@ async fn main() -> Result<(), Error> {
     let listener = TcpListener::bind(&"127.0.0.1:8080".to_string()).await.expect("Failed to bind");
     info!("Listening on: http://localhost:8080/");
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(accept_connection(stream, hubs.clone()));
+        accept_connection(stream, hubs.clone()).await;
     }
 
     Ok(())
@@ -29,7 +29,7 @@ async fn accept_connection(stream: TcpStream, hubs: Arc<HubManager>) {
     let addr = stream.peer_addr().expect("connected streams should have a peer address");
     let ws_stream = tokio_tungstenite::accept_async(stream).await.expect("Error during the websocket handshake occurred");
     info!("New WebSocket connection: {}", addr);
-    hubs.create_client(ws_stream).await;
+    hubs.create_client(ws_stream).await
 }
 
 #[derive(Clone, Deserialize)]

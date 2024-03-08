@@ -1,19 +1,18 @@
-use std::{array, collections::HashSet, sync::{atomic::{AtomicI32, Ordering}, Arc}, time::Duration};
+use std::{array, collections::{HashMap, HashSet}, sync::{atomic::{AtomicI32, Ordering}, Arc}, time::Duration};
 use dashmap::DashMap;
-use futures_util::StreamExt;
 use log::warn;
 use rand::Rng;
-use tokio::{net::TcpStream, sync::{broadcast, RwLock}, time};
+use tokio::{net::TcpStream, sync::mpsc, time};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::Message;
-use crate::{events::ServerEvent, players::{forward_messages_from_channel, listen_for_messages, Coordinates, Entity, EntityType, Player}, Config};
+use crate::{events::{ServerEvent, UserEventMessage}, players::{handle_client_connection, Coordinates, Entity, EntityType, Player}, Config};
 
 pub static ID_COUNTER: AtomicI32 = AtomicI32::new(0);
 
 pub type Id = i32;
 
 pub struct HubManager {
-    hubs: DashMap<Id, Arc<Hub>>,
+    hubs: DashMap<Id, HubPlayers>,
     config: Config
 }
 
@@ -23,79 +22,99 @@ impl HubManager {
         HubManager { hubs: DashMap::new(), config: Config::get().await }
     }
 
-    fn find_hub(&self) -> Option<Arc<Hub>> {
+    fn find_hub(&self) -> Option<HubPlayers> {
         if self.hubs.len() == 0 {
             return None;
         }
-        let min_hub = self.hubs.iter().min_by_key(|h| h.clients.len()).unwrap();
-        if min_hub.clients.len() > min_hub.config.max_player_count as usize {
+        let min_hub = self.hubs.iter_mut().min_by_key(|h| h.player_count).unwrap();
+        if min_hub.player_count > self.config.max_player_count {
             return None;
         }
         Some(min_hub.clone())
     }
 
-    fn create_hub(&self) -> Arc<Hub> {
-        let new_hub = Arc::new(Hub::new(&self.config));
-        new_hub.clone().start();
-        self.hubs.insert(ID_COUNTER.fetch_add(1, Ordering::SeqCst), new_hub.clone());
-        new_hub
+    async fn create_hub(&self, stream: WebSocketStream<TcpStream>) {
+        let mut new_hub = Hub::new(&self.config);
+        let (user_adder, user_receiver) = mpsc::channel(1);
+        let _ = user_adder.send(stream).await;
+        self.hubs.insert(ID_COUNTER.fetch_add(1, Ordering::SeqCst), HubPlayers { adder: user_adder, player_count: 0 });
+        new_hub.game_update_loop(user_receiver).await;
     }
 
-    pub async fn create_client(&self, stream: WebSocketStream<TcpStream>) {
-        let hub = self.find_hub().unwrap_or_else(|| self.create_hub());
-        hub.spawn_player(stream).await;
+    pub async fn create_client(self: Arc<Self>, stream: WebSocketStream<TcpStream>) {
+        match self.find_hub() {
+            Some(hub) => {
+                if hub.adder.send(stream).await.is_err() {
+                    warn!("Tried to add a player to a hub that has ended");
+
+                }
+            },
+            _ => {tokio::spawn(async move {
+                self.create_hub(stream).await;
+            });}
+        };
     }
 }
 
+#[derive(Debug, Clone)]
+struct HubPlayers {
+    adder: mpsc::Sender<WebSocketStream<TcpStream>>,
+    player_count: i32
+}
+
 pub struct Hub {
-    clients: DashMap<Id, broadcast::Sender<Message>>,
-    entities: DashMap<Id, Arc<RwLock<Entity>>>,
-    config: Config
+    clients: HashMap<Id, mpsc::Sender<Message>>,
+    entities: HashMap<Id, Entity>,
+    config: Config,
+    queued_events: Vec<ServerEvent>
 }
 
 impl Hub {
 
     pub fn new(config: &Config) -> Hub {
          Hub {
-            clients: DashMap::new(),
-            entities: DashMap::new(),
-            config: config.clone()
+            clients: HashMap::new(),
+            entities: HashMap::new(),
+            config: config.clone(),
+            queued_events: Vec::new()
         }
     }
 
-    fn start(self: Arc<Self>) {
-        tokio::spawn(async move {
-            self.game_update_loop().await;
-        });
-    }
-    
-    async fn update_entity(&self, entity: &Arc<RwLock<Entity>>, tiles: &mut PlayerPositions, tick: &u32, events: &mut Vec<ServerEvent>) {
-        let mut entity_data = entity.write().await;
-        let old_coords = entity_data.coordinates.clone();
-        entity_data.move_once();
-        if tiles.add(&entity_data.coordinates, entity_data.id) {
-            tiles.remove(entity_data.id, &old_coords);
-        }
-        entity_data.tick(tick, events);
-        events.push(ServerEvent::Position { user: entity_data.id, coordinates: entity_data.coordinates.clone() });
-    } 
-
-    async fn update_all_entities(&self, tiles: &mut PlayerPositions, tick: &u32, events: &mut Vec<ServerEvent>) {
-        for entity in self.entities.iter() {
-            self.update_entity(entity.value(), tiles, tick, events).await;
+    async fn update_all_entities(&mut self, tiles: &mut PlayerPositions, tick: &u32) {
+        for (_, entity) in self.entities.iter_mut() {
+            let old_coords = entity.coordinates.clone();
+            entity.move_once();
+            if tiles.add(&entity.coordinates, entity.id) {
+                tiles.remove(entity.id, &old_coords);
+            }
+            entity.tick(tick, &mut self.queued_events);
+            self.queued_events.push(ServerEvent::Position { user: entity.id, coordinates: entity.coordinates.clone() });
         }
     } 
 
-    async fn game_update_loop(&self) {
+    async fn game_update_loop(&mut self, mut user_adder: mpsc::Receiver<WebSocketStream<TcpStream>>) {
         let mut tiles = PlayerPositions::new(self.config.map_size / 10.);
         let mut interval = time::interval(Duration::from_millis(self.config.update_delay_ms));
         let mut tick = 0u32;
+        let (update_sender, mut received_updates) = mpsc::channel::<UserEventMessage>(16);
         loop {
-            interval.tick().await;
-            let mut events = Vec::new();
-            self.update_all_entities(&mut tiles, &tick, &mut events).await;
-            self.dispatch_events(events);
-            tick += 1;
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.update_all_entities(&mut tiles, &tick).await;
+                    self.dispatch_events().await;
+                    self.queued_events.clear();
+                    tick += 1;
+                },
+                Some(stream) = user_adder.recv() => {
+                    self.spawn_player(stream, update_sender.clone());
+                },
+                Some(event) = received_updates.recv() => {
+                    let user = self.entities.get_mut(&event.user);
+                    if let Some(user) = user {
+                        user.handle_event(event.event);
+                    }
+                }
+            }
         }
     }
 
@@ -103,60 +122,45 @@ impl Hub {
         rand::thread_rng().gen_range(0..self.config.map_size as i32) as f64
     }
 
-    pub fn dispatch_event(&self, event: ServerEvent) {
-        self.dispatch_events(vec![event]);
-    }
-
-    pub fn dispatch_events(&self, events: Vec<ServerEvent>) {
-        let data = bincode::serialize(&events).unwrap();
-        for client in self.clients.iter() {
-            if let Err(_) = client.send(Message::Binary(data.clone())) {
+    pub async fn dispatch_events(&self) {
+        let data = bincode::serialize(&self.queued_events).unwrap();
+        for (_, client) in self.clients.iter() {
+            if let Err(_) = client.send(Message::Binary(data.clone())).await {
                 warn!("Sent message to a client that isn't receiving messages");
             }
         }
     }
 
-    pub fn kick_player(&self, id: Id) {
+    // TODO: kick player after their connection ends
+    pub fn kick_player(&mut self, id: Id) {
         self.clients.remove(&id);
         self.remove_entity(id);
     }
 
-    pub fn remove_entity(&self, id: Id) {
+    pub fn remove_entity(&mut self, id: Id) {
         if self.entities.remove(&id).is_none() {
             warn!("Tried removing an entity that does not exist: {}", id);
             return;
         }
-        self.dispatch_event(ServerEvent::EntityDelete(id));
+        self.queued_events.push(ServerEvent::EntityDelete(id));
     }
 
-    pub async fn spawn_entity(&self, entity: Entity) -> Arc<RwLock<Entity>> {
-        let id = entity.id.clone();
-        let entity_arc = Arc::new(RwLock::new(entity));
-        let ent = entity_arc.clone();
-        let data = ent.read().await;
-        self.dispatch_event(ServerEvent::EntityCreate { id, tank: data.tank.id, position: data.coordinates.clone() });
-        self.entities.insert(id, entity_arc.clone());
-        entity_arc
+    pub fn spawn_entity(&mut self, entity: Entity) {
+        self.queued_events.push(ServerEvent::EntityCreate { id: entity.id, tank: entity.tank.id, position: entity.coordinates.clone() });
+        self.entities.insert(entity.id, entity);
     }
 
-    pub async fn spawn_player(self: &Arc<Self>, stream: WebSocketStream<TcpStream>) {
-        let (mut ws_sender, ws_receiver) = stream.split();
-        let (sender, mut receiver) = broadcast::channel::<Message>(16);
+    pub fn spawn_player(&mut self, stream: WebSocketStream<TcpStream>, updates: mpsc::Sender<UserEventMessage>) {
+        let (sender, receiver) = mpsc::channel::<Message>(1);
         let coords = Coordinates {
             x: self.random_coordinate(),
             y: self.random_coordinate()
         };
         let id = ID_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let entity_data = Entity::new(coords, id, &self.config, EntityType::Player(Player { points: 0, score: 0 }));
-        let entity = self.spawn_entity(entity_data).await;
-
-        tokio::spawn(listen_for_messages(entity.clone(), ws_receiver, self.clone()));
-        
-        forward_messages_from_channel(
-            &mut ws_sender, 
-            &mut receiver
-        ).await;
         self.clients.insert(id, sender);
+        let entity_data = Entity::new(coords, id, &self.config, EntityType::Player(Player { points: 0, score: 0 }));
+        self.spawn_entity(entity_data);
+        tokio::spawn(handle_client_connection(stream, receiver, updates, id));
     }
 }
 

@@ -1,12 +1,12 @@
 use std::{array, sync::{atomic::Ordering, Arc}, usize};
-use futures_util::{future, stream::{SplitSink, SplitStream}, SinkExt, StreamExt, TryStreamExt};
-use log::{info, warn};
+use futures_util::{SinkExt, StreamExt};
+use log::warn;
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpStream, sync::{broadcast, RwLock}};
+use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::WebSocketStream;
-use tungstenite::Message;
+use tungstenite::{protocol::CloseFrame, Message};
 
-use crate::{events::{DirectionChange, ServerEvent, UserEvent}, hubs::{Hub, Id, ID_COUNTER}, Config};
+use crate::{events::{DirectionChange, ServerEvent, UserEvent, UserEventMessage}, hubs::{Id, ID_COUNTER}, Config};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct Coordinates {
@@ -55,39 +55,53 @@ pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
     }
 }
 
-pub async fn forward_messages_from_channel(
-    conn: &mut SplitSink<WebSocketStream<TcpStream>, Message>, 
-    messages: &mut broadcast::Receiver<Message>
-) {
-    while let Ok(message) = messages.recv().await {
-        if let Err(e) = conn.send(message).await {
-            warn!("Error sending data: {:?}", e);
-        }
-    }
-    if let Err(e) = conn.close().await {
-        warn!("Error closing connection: {:?}", e);
-    } else {
-        info!("Closed connection succesfully");
-    }
-}
-
-pub async fn listen_for_messages(player: Arc<RwLock<Entity>>, read: SplitStream<WebSocketStream<TcpStream>>, hub: Arc<Hub>) {
-    read.try_filter(|msg| future::ready(msg.is_text()))
-    .for_each(|msg| async {
-        if msg.is_err() {
-            return;
-        }
-        let mut entity = player.write().await;
-        
-        let Ok(event) = bincode::deserialize(msg.unwrap().into_data().as_slice()) else {
-            hub.kick_player(entity.id);
-            return;
+pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut messages: mpsc::Receiver<Message>, updates: mpsc::Sender<UserEventMessage>, id: Id) {
+    let close_value = loop {
+        tokio::select! {
+            incoming_message = conn.next() => {
+                if let Some(close) = handle_message(incoming_message, &updates, id, &mut conn).await {
+                    break close;
+                }
+            }
+            sent_message = messages.recv() => {
+                let Some(message) = sent_message else {
+                    break None;
+                };
+                if let Err(_) = conn.send(message).await {
+                    break None;
+                }
+            }
         };
-        entity.handle_event(event);
-    }).await;
+    };
+    if let Err(e) = conn.close(close_value).await {
+        warn!("Error closing connection {:?}", e);
+    }
 }
 
-#[derive(Serialize, Clone, Debug)]
+async fn handle_message<'a>(incoming_message: Option<Result<Message, tungstenite::error::Error>>, updates: &mpsc::Sender<UserEventMessage>, id: Id, conn: &mut WebSocketStream<TcpStream>) -> Option<Option<CloseFrame<'a>>> {
+    let Some(Ok(message)) = incoming_message else {
+        return Some(None);
+    };
+    match message {
+        Message::Binary(binary) => {
+            let Ok(event) = bincode::deserialize(binary.as_slice()) else {
+                return Some(None);
+            };
+            if let Err(_) = updates.send(UserEventMessage {
+                event,
+                user: id
+            }).await {
+                return Some(None);
+            }
+        },
+        Message::Close(close) => return Some(close),
+        Message::Ping(ping) => {let _ = conn.send(Message::Pong(ping.to_vec())).await;},
+        _ => {}
+    };
+    None
+}
+
+#[derive(Debug)]
 pub struct Entity {
     pub id: Id,
     // Position in the map
@@ -223,7 +237,7 @@ impl Entity {
         self.max_velocity = velocity;
     }
 
-    fn handle_event(&mut self, event: UserEvent) {
+    pub fn handle_event(&mut self, event: UserEvent) {
         match event {
             UserEvent::DirectionChange(d) => self.change_direction(d),
             UserEvent::Yaw(yaw) => self.target_yaw = yaw,
