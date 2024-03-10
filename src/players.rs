@@ -1,4 +1,4 @@
-use std::{array, sync::{atomic::Ordering, Arc}, usize};
+use std::{array, sync::Arc, usize};
 use futures_util::{SinkExt, StreamExt};
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -6,32 +6,23 @@ use tokio::{net::TcpStream, sync::mpsc};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::{protocol::CloseFrame, Message};
 
-use crate::{events::{DirectionChange, ServerEvent, UserEvent, UserEventMessage}, hubs::{Id, ID_COUNTER}, Config};
+use crate::{events::{DirectionChange, UserEvent, UserMessage}, hubs::Id, Config};
 
 #[derive(Serialize, Clone, Debug)]
-pub struct Coordinates {
+pub struct Vector {
     pub x: f64,
     pub y: f64
 }
 
-impl Coordinates {
-    fn empty() -> Self {
+impl Vector {
+    pub fn empty() -> Self {
         Self {
             x: 0., 
             y: 0.
         }
     }
 
-    pub fn min(&mut self, other: &Coordinates) -> &mut Self {
-        if self.x.abs() < other.x.abs() {
-            self.x = other.x;
-        } if self.y.abs() < other.y.abs() {
-            self.y = other.y;
-        }
-        self
-    }
-
-    pub fn cap(&mut self, max: &Coordinates) -> &mut Self {
+    pub fn cap(&mut self, max: &Vector) -> &mut Self {
         if self.x.abs() > max.x.abs() {
             self.x = max.x;
         } if self.y.abs() > max.y.abs() {
@@ -40,22 +31,22 @@ impl Coordinates {
         self
     }
 
-    pub fn combine(&mut self, other: &Coordinates) -> &mut Self {
+    pub fn combine(&mut self, other: &Vector) -> &mut Self {
         self.x += other.x;
         self.y += other.y;
         self
     }
 }
 
-pub fn yaw_coordinate_change(yaw: i32) -> Coordinates {
+pub fn yaw_coordinate_change(yaw: i32) -> Vector {
     let radians = yaw as f64 * std::f64::consts::PI / 180.;
-    Coordinates { 
+    Vector { 
         x: radians.sin(), 
         y: radians.cos() 
     }
 }
 
-pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut messages: mpsc::Receiver<Message>, updates: mpsc::Sender<UserEventMessage>, id: Id) {
+pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut messages: mpsc::Receiver<Message>, updates: mpsc::Sender<UserMessage>, id: Id) {
     let close_value = loop {
         tokio::select! {
             incoming_message = conn.next() => {
@@ -76,9 +67,14 @@ pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut 
     if let Err(e) = conn.close(close_value).await {
         warn!("Error closing connection {:?}", e);
     }
+    let _ = updates.send(UserMessage::GoingAway(id)).await;
 }
 
-async fn handle_message<'a>(incoming_message: Option<Result<Message, tungstenite::error::Error>>, updates: &mpsc::Sender<UserEventMessage>, id: Id, conn: &mut WebSocketStream<TcpStream>) -> Option<Option<CloseFrame<'a>>> {
+async fn handle_message<'a>(
+    incoming_message: Option<Result<Message, 
+    tungstenite::error::Error>>, 
+    updates: &mpsc::Sender<UserMessage>, id: Id, 
+    conn: &mut WebSocketStream<TcpStream>) -> Option<Option<CloseFrame<'a>>> {
     let Some(Ok(message)) = incoming_message else {
         return Some(None);
     };
@@ -87,7 +83,7 @@ async fn handle_message<'a>(incoming_message: Option<Result<Message, tungstenite
             let Ok(event) = bincode::deserialize(binary.as_slice()) else {
                 return Some(None);
             };
-            if let Err(_) = updates.send(UserEventMessage {
+            if let Err(_) = updates.send(UserMessage::Event {
                 event,
                 user: id
             }).await {
@@ -105,30 +101,30 @@ async fn handle_message<'a>(incoming_message: Option<Result<Message, tungstenite
 pub struct Entity {
     pub id: Id,
     // Position in the map
-    pub coordinates: Coordinates,
+    pub coordinates: Vector,
     // Amount coordinates is changed when moved
-    pub velocity: Coordinates,
+    pub velocity: Vector,
     // Max amount of amount coordinates is user
-    pub max_velocity: Coordinates,
+    pub max_velocity: Vector,
     // Amount velocity is changed when moved
-    pub acceleration: Coordinates,
+    pub acceleration: Vector,
     pub target_yaw: i32,
     pub yaw: i32,
     pub tank: Arc<Tank>,
-    pub levels: [u8; 8],
-    pub stats: EntityType,
-    shooting: bool
+    levels: [u8; 8],
+    stats: EntityType,
+    pub shooting: bool
 }
 
 impl Entity {
 
-    pub fn new(coords: Coordinates, id: Id, config: &Config, inner: EntityType) -> Self {
+    pub fn new(coords: Vector, id: Id, config: &Config, inner: EntityType) -> Self {
         Self {
             id,
             coordinates: coords,
-            velocity: Coordinates::empty(),
-            max_velocity: Coordinates::empty(),
-            acceleration: Coordinates::empty(),
+            velocity: Vector::empty(),
+            max_velocity: Vector::empty(),
+            acceleration: Vector::empty(),
             yaw: 0,
             target_yaw: 0,
             levels: array::from_fn(|_| 0),
@@ -178,16 +174,16 @@ impl Entity {
         }
     }
 
-    fn create_bullet(&self, cannon: &Cannon) -> Self {
+    pub fn create_bullet(&self, cannon: &Cannon, id: i32) -> Self {
         let yaw = self.yaw + cannon.yaw;
         let direction = yaw_coordinate_change(yaw);
         let bullet = EntityType::Bullet(Bullet { author: self.id });
         Entity {
-            id: ID_COUNTER.fetch_add(1, Ordering::SeqCst),
+            id,
             coordinates: self.coordinates.clone(),
             velocity: direction.clone(),
-            max_velocity: Coordinates { x: 0., y: 0. },
-            acceleration: Coordinates { x: direction.x / 10., y: direction.y / 10. },
+            max_velocity: Vector { x: 0., y: 0. },
+            acceleration: Vector { x: direction.x / 10., y: direction.y / 10. },
             yaw,
             target_yaw: yaw,
             tank: cannon.bullet.clone(),
@@ -202,12 +198,7 @@ impl Entity {
         }
     }
 
-    pub fn tick(&mut self, tick: &u32, events: &mut Vec<ServerEvent>) {
-        for cannon in self.active_cannons(*tick) {
-            let entity = self.create_bullet(cannon);
-            events.push(ServerEvent::EntityCreate { id: entity.id, tank: entity.tank.id, position: entity.coordinates });
-            // Spawn the dang entity
-        }
+    pub fn tick(&mut self) {
         if self.yaw != self.target_yaw {
             self.update_yaw();
         }
@@ -230,7 +221,7 @@ impl Entity {
         let velocity = direction.to_velocity();
         let acceleration_x = velocity.x / 10.;
         let acceleration_y = velocity.y / 10.;
-        self.acceleration = Coordinates {
+        self.acceleration = Vector {
             x: if acceleration_x != 0. {acceleration_x} else {-self.max_velocity.x / 10.},
             y: if acceleration_y != 0. {acceleration_y} else {-self.max_velocity.y / 10.}
         };

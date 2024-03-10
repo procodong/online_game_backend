@@ -1,45 +1,52 @@
 use serde::{Deserialize, Serialize};
 use serde;
-
 use crate::hubs::Id;
-use crate::players::{Coordinates, Stat};
+use crate::players::{Vector, Stat};
 
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize)]
 #[serde(tag = "event")]
 pub enum UserEvent {
+    #[serde(rename = "0")]
     SetShooting(bool),
+    #[serde(rename = "1")]
     Yaw(i32),
+    #[serde(rename = "2")]
     LevelUpgrade(Stat),
+    #[serde(rename = "3")]
     DirectionChange(DirectionChange)
 }
 
-pub struct UserEventMessage {
-    pub event: UserEvent,
-    pub user: Id
+pub enum UserMessage {
+    Event {
+        event: UserEvent,
+        user: Id
+    },
+    GoingAway(Id)
 }
-
-#[derive(Serialize, Clone)]
-#[serde(tag = "event")]
+#[derive(Serialize)]
+#[serde(tag = "e")]
 pub enum ServerEvent {
+    #[serde(rename = "0")]
     EntityDelete(Id),
-    EntityCreate {id: Id, tank: i32, position: Coordinates},
-    Yaw {user: Id, yaw: i32},
-    Position {user: Id, coordinates: Coordinates},
-    TankUpgrade {user: Id, tank: i32},
+    #[serde(rename = "1")]
+    EntityCreate {id: Id, tank: i32, position: Vector},
+    #[serde(rename = "2")]
+    Position {user: Id, coordinates: Vector, yaw: i32, velocity: Vector},
+    //TankUpgrade {user: Id, tank: i32},
 }
 
 #[derive(Deserialize, Clone)]
 pub struct DirectionChange {
-    pub up: bool,
-    pub left: bool,
-    pub down: bool,
-    pub right: bool
+    up: bool,
+    left: bool,
+    down: bool,
+    right: bool
 }
 
 impl DirectionChange {
-    pub fn to_velocity(&self) -> Coordinates {
-        Coordinates {
+    pub fn to_velocity(&self) -> Vector {
+        Vector {
             x: self.right as i32 as f64 - self.left as i32 as f64,
             y: self.down as i32 as f64 - self.up as i32 as f64
         }
