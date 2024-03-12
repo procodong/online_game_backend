@@ -1,4 +1,5 @@
-use std::{array, collections::{HashMap, HashSet}, time::Duration};
+use std::{array, collections::HashSet, time::Duration};
+use indexmap::IndexMap;
 use log::warn;
 use tokio::{net::TcpStream, sync::{broadcast, mpsc}, time};
 use tokio_tungstenite::WebSocketStream;
@@ -6,12 +7,6 @@ use crate::{events::{ServerEvent, UserMessage}, players::{handle_client_connecti
 
 
 pub type Id = u32;
-
-pub struct HubManager {
-    hubs: HashMap<Id, HubPlayers>,
-    config: Config,
-    last_id: Id
-}
 
 struct IdCounter(Id);
 
@@ -23,29 +18,35 @@ impl IdCounter {
     }
 }
 
+pub struct HubManager {
+    hubs: IndexMap<Id, HubPlayers>,
+    config: Config,
+    ids: IdCounter
+}
+
 impl HubManager {
 
     pub async fn new() -> HubManager {
-        HubManager { hubs: HashMap::new(), config: Config::get().await, last_id: 0 }
+        HubManager { hubs: IndexMap::new(), config: Config::get().await, ids: IdCounter(0) }
     }
 
     async fn create_hub(&mut self, stream: WebSocketStream<TcpStream>) {
         let mut new_hub = Hub::new(&self.config);
         let (user_adder, user_receiver) = mpsc::channel(32);
         let _ = user_adder.send(stream).await;
-        self.hubs.insert(self.last_id, HubPlayers { adder: user_adder, player_count: 0 });
-        self.last_id += 1;
+        self.hubs.insert(self.ids.next(), HubPlayers { adder: user_adder, player_count: 0 });
         tokio::spawn(async move {
             new_hub.game_update_loop(user_receiver).await;
         });
     }
 
     pub async fn create_client(&mut self, stream: WebSocketStream<TcpStream>) {
-        match self.hubs.values().min_by_key(|h| h.player_count) {
+        match self.hubs.values_mut().min_by_key(|h| h.player_count) {
             Some(hub) if hub.player_count < self.config.max_player_count => {
                 if hub.adder.send(stream).await.is_err() {
                     warn!("Tried to add a player to a hub that has ended");
-
+                } else {
+                    hub.player_count += 1;
                 }
             },
             _ => self.create_hub(stream).await
@@ -53,14 +54,13 @@ impl HubManager {
     }
 }
 
-
 struct HubPlayers {
     adder: mpsc::Sender<WebSocketStream<TcpStream>>,
     player_count: i32
 }
 
 struct Hub {
-    entities: HashMap<Id, Entity>,
+    entities: IndexMap<Id, Entity>,
     config: Config,
     queued_events: Vec<ServerEvent>,
     ids: IdCounter,
@@ -71,7 +71,7 @@ impl Hub {
 
     fn new(config: &Config) -> Hub {
          Hub {
-            entities: HashMap::new(),
+            entities: IndexMap::new(),
             config: config.clone(),
             queued_events: Vec::new(),
             ids: IdCounter(0),
@@ -81,7 +81,7 @@ impl Hub {
  
     async fn update_entities(&mut self, tick: u32) {
         let mut created_bullets = Vec::new();
-        for (_, entity) in self.entities.iter_mut() {
+        for entity in self.entities.values_mut() {
             let old_coords = entity.coordinates.clone();
 
             entity.update_movement();
@@ -139,7 +139,7 @@ impl Hub {
     }
 
     fn remove_entity(&mut self, id: Id) {
-        if self.entities.remove(&id).is_none() {
+        if self.entities.shift_remove(&id).is_none() {
             warn!("Tried removing an entity that does not exist: {}", id);
             return;
         }
