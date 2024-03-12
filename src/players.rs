@@ -2,7 +2,7 @@ use std::{array, sync::Arc, usize};
 use futures_util::{SinkExt, StreamExt};
 use log::warn;
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::{net::TcpStream, sync::{broadcast, mpsc}};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::{protocol::CloseFrame, Message};
 
@@ -46,7 +46,7 @@ pub fn yaw_coordinate_change(yaw: i32) -> Vector {
     }
 }
 
-pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut messages: mpsc::Receiver<Message>, updates: mpsc::Sender<UserMessage>, id: Id) {
+pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut messages: broadcast::Receiver<Vec<u8>>, updates: mpsc::Sender<UserMessage>, id: Id) {
     let close_value = loop {
         tokio::select! {
             incoming_message = conn.next() => {
@@ -55,10 +55,10 @@ pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut 
                 }
             }
             sent_message = messages.recv() => {
-                let Some(message) = sent_message else {
+                let Ok(message) = sent_message else {
                     break None;
                 };
-                if let Err(_) = conn.send(message).await {
+                if let Err(_) = conn.send(Message::Binary(message)).await {
                     break None;
                 }
             }
@@ -174,7 +174,7 @@ impl Entity {
         }
     }
 
-    pub fn create_bullet(&self, cannon: &Cannon, id: i32) -> Self {
+    pub fn create_bullet(&self, cannon: &Cannon, id: Id) -> Self {
         let yaw = self.yaw + cannon.yaw;
         let direction = yaw_coordinate_change(yaw);
         let bullet = EntityType::Bullet(Bullet { author: self.id });
@@ -198,12 +198,6 @@ impl Entity {
         }
     }
 
-    pub fn tick(&mut self) {
-        if self.yaw != self.target_yaw {
-            self.update_yaw();
-        }
-    }
-
     fn update_yaw(&mut self) {
         if self.yaw < self.target_yaw {
             self.yaw += 1;
@@ -212,9 +206,12 @@ impl Entity {
         }
     }
 
-    pub fn move_once(&mut self) {
+    pub fn update_movement(&mut self) {
         self.coordinates.combine(&self.velocity);
         self.velocity.combine(&self.acceleration).cap(&self.max_velocity);
+        if self.yaw != self.target_yaw {
+            self.update_yaw();
+        }
     }
 
     fn change_direction(&mut self, direction: DirectionChange) {
@@ -230,10 +227,10 @@ impl Entity {
 
     pub fn handle_event(&mut self, event: UserEvent) {
         match event {
-            UserEvent::DirectionChange(d) => self.change_direction(d),
-            UserEvent::Yaw(yaw) => self.target_yaw = yaw,
-            UserEvent::SetShooting(shooting) => self.shooting = shooting,
-            UserEvent::LevelUpgrade(stat) => self.increment_level(stat)
+            UserEvent::DirectionChange { direction } => self.change_direction(direction),
+            UserEvent::Yaw { yaw } => self.target_yaw = yaw,
+            UserEvent::SetShooting { shooting } => self.shooting = shooting,
+            UserEvent::LevelUpgrade { stat } => self.increment_level(stat)
         };
     }
 }

@@ -5,16 +5,16 @@ use crate::players::{Vector, Stat};
 
 
 #[derive(Deserialize)]
-#[serde(tag = "event")]
+#[serde(tag = "e")]
 pub enum UserEvent {
     #[serde(rename = "0")]
-    SetShooting(bool),
+    SetShooting { shooting: bool },
     #[serde(rename = "1")]
-    Yaw(i32),
+    Yaw { yaw: i32 },
     #[serde(rename = "2")]
-    LevelUpgrade(Stat),
+    LevelUpgrade { stat: Stat },
     #[serde(rename = "3")]
-    DirectionChange(DirectionChange)
+    DirectionChange { direction: DirectionChange }
 }
 
 pub enum UserMessage {
@@ -28,11 +28,11 @@ pub enum UserMessage {
 #[serde(tag = "e")]
 pub enum ServerEvent {
     #[serde(rename = "0")]
-    EntityDelete(Id),
+    EntityDelete { id: Id },
     #[serde(rename = "1")]
-    EntityCreate {id: Id, tank: i32, position: Vector},
+    EntityCreate { id: Id, tank: i32, position: Vector },
     #[serde(rename = "2")]
-    Position {user: Id, coordinates: Vector, yaw: i32, velocity: Vector},
+    Position { user: Id, coordinates: Vector, yaw: i32, velocity: Vector },
     //TankUpgrade {user: Id, tank: i32},
 }
 
