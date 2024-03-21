@@ -3,7 +3,7 @@ use indexmap::IndexMap;
 use log::warn;
 use tokio::{net::TcpStream, sync::{broadcast, mpsc}, time};
 use tokio_tungstenite::WebSocketStream;
-use crate::{events::{ServerEvent, UserMessage}, players::{handle_client_connection, Entity, EntityType, Player, Vector}, Config};
+use crate::{events::{ServerEvent, UserMessage}, players::{handle_client_connection, Entity, EntityType, Player, Vec2}, Config};
 
 
 pub type Id = u32;
@@ -12,9 +12,8 @@ struct IdCounter(Id);
 
 impl IdCounter {
     fn next(&mut self) -> Id {
-        let current = self.0;
         self.0 += 1;
-        current
+        self.0
     }
 }
 
@@ -41,13 +40,12 @@ impl HubManager {
     }
 
     pub async fn create_client(&mut self, stream: WebSocketStream<TcpStream>) {
-        match self.hubs.values_mut().min_by_key(|h| h.player_count) {
+        let found_hub = self.hubs.values_mut().min_by_key(|h| h.player_count);
+        match found_hub {
             Some(hub) if hub.player_count < self.config.max_player_count => {
-                if hub.adder.send(stream).await.is_err() {
-                    warn!("Tried to add a player to a hub that has ended");
-                } else {
+                if hub.adder.send(stream).await.is_ok() {
                     hub.player_count += 1;
-                }
+                } 
             },
             _ => self.create_hub(stream).await
         };
@@ -64,7 +62,7 @@ struct Hub {
     config: Config,
     queued_events: Vec<ServerEvent>,
     ids: IdCounter,
-    tiles: PlayerPositions
+    tiles: PlayerPositions<100>
 }
 
 impl Hub {
@@ -75,31 +73,53 @@ impl Hub {
             config: config.clone(),
             queued_events: Vec::new(),
             ids: IdCounter(0),
-            tiles: PlayerPositions::new(config.map_size / 10.)
+            tiles: PlayerPositions::new(config.map_size as usize)
         }
     }
  
-    async fn update_entities(&mut self, tick: u32) {
-        let mut created_bullets = Vec::new();
-        for entity in self.entities.values_mut() {
+    fn update_entities(&mut self, tick: u32) {
+        let mut entities = std::mem::replace(&mut self.entities, IndexMap::new());
+        for (id, entity) in entities.iter_mut() {
+            let id = *id;
             let old_coords = entity.coordinates.clone();
+            let old_yaw = entity.yaw;
 
             entity.update_movement();
 
-            if self.tiles.add(&entity.coordinates, entity.id) {
-                self.tiles.remove(&old_coords, entity.id);
+            if self.tiles.add(&entity.coordinates, id) {
+                self.tiles.remove(&old_coords, id);
             }
-
+            if entity.coordinates != old_coords || entity.yaw != old_yaw {
+                self.queued_events.push(ServerEvent::Position { user: id, coordinates: entity.coordinates.clone(), velocity: entity.velocity.clone(), yaw: entity.yaw });
+            }
             for cannon in entity.active_cannons(tick) {
-                let entity = entity.create_bullet(cannon, self.ids.next());
-                created_bullets.push(entity);
+                let bullet = entity.create_bullet(cannon, id);
+                self.spawn_entity(bullet);
             }
-
-            self.queued_events.push(ServerEvent::Position { user: entity.id, coordinates: entity.coordinates.clone(), velocity: entity.velocity.clone(), yaw: entity.yaw });
         }
-        for bullet in created_bullets.into_iter() {
-            self.spawn_entity(bullet);
+        let mut hits = vec![];
+        for entity in entities.values() {
+            let Some(tile) = self.tiles.get_mut(&entity.coordinates) else {
+                warn!("Entity was outside tiles");
+                continue;
+            };
+            for id in tile.iter() {
+                let Some(other_entity) = entities.get(id) else {
+                    continue;
+                };
+                if entity.distance_from(&other_entity) < entity.tank.size + other_entity.tank.size {
+                    hits.push((*id, entity.stat(crate::players::Stat::BodyDamage)));
+                }
+            }
         }
+        for (id, hit) in hits.into_iter() {
+            let Some(entity) = entities.get_mut(&id) else {continue;};
+            if entity.damage(hit) {
+                entities.swap_remove(&id);
+            }
+        }
+        let created_bullets = std::mem::replace(&mut self.entities, entities);
+        self.entities.extend(created_bullets);
     }
 
     async fn game_update_loop(&mut self, mut user_adder: mpsc::Receiver<WebSocketStream<TcpStream>>) {
@@ -110,11 +130,9 @@ impl Hub {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.update_entities(tick).await;
+                    self.update_entities(tick);
                     let data = bincode::serialize(&self.queued_events).unwrap();
-                    if let Err(e) = event_sender.send(data) {
-                        warn!("Error sending events {:?}", e);
-                    }
+                    let _ = event_sender.send(data);
                     self.queued_events.clear();
                     tick += 1;
                 },
@@ -131,59 +149,73 @@ impl Hub {
                                 user.handle_event(event);
                             }
                         },
-                        UserMessage::GoingAway(id) => self.remove_entity(id)
+                        UserMessage::GoingAway(id) => {
+                            self.remove_entity(id);
+                        }
                     }
                 }
             }
         }
     }
 
-    fn remove_entity(&mut self, id: Id) {
-        if self.entities.shift_remove(&id).is_none() {
-            warn!("Tried removing an entity that does not exist: {}", id);
-            return;
-        }
+    fn remove_entity(&mut self, id: Id) -> Option<Entity> {
+        let entity = self.entities.swap_remove(&id)?;
+        self.tiles.remove(&entity.coordinates, id);
         self.queued_events.push(ServerEvent::EntityDelete{ id });
+        Some(entity)
     }
 
-    fn spawn_entity(&mut self, entity: Entity) {
-        self.queued_events.push(ServerEvent::EntityCreate { id: entity.id, tank: entity.tank.id, position: entity.coordinates.clone() });
-        self.entities.insert(entity.id, entity);
-    }
-
-    fn spawn_player(&mut self, stream: WebSocketStream<TcpStream>, updates: mpsc::Sender<UserMessage>, events: broadcast::Receiver<Vec<u8>>) {
+    fn spawn_entity(&mut self, entity: Entity) -> Id {
         let id = self.ids.next();
-        let entity_data = Entity::new(Vector::empty(), id, &self.config, EntityType::Player(Player { points: 0, score: 0 }));
-        self.spawn_entity(entity_data);
-        tokio::spawn(handle_client_connection(stream, events, updates, id));
+        self.queued_events.push(ServerEvent::EntityCreate { id, tank: entity.tank.id, position: entity.coordinates.clone() });
+        self.entities.insert(id, entity);
+        id
+    }
+
+    fn spawn_player(&mut self, stream: WebSocketStream<TcpStream>, update_sender: mpsc::Sender<UserMessage>, events: broadcast::Receiver<Vec<u8>>) {
+        let entity = Entity::new(Vec2::empty(), &self.config, EntityType::Player(Player { points: 0, score: 0 }));
+        let id = self.spawn_entity(entity);
+        tokio::spawn(handle_client_connection(stream, events, update_sender, id));
     }
 }
 
 type Tile = HashSet<Id>;
 
-struct PlayerPositions {
-    tiles: [[Tile; 10]; 10],
-    scale: f64
+struct PlayerPositions<const I: usize> {
+    tiles: [Tile; I],
+    scale: usize
 }
 
-impl PlayerPositions {
+impl <const I: usize> PlayerPositions<I> {
 
-    fn new(scale: f64) -> Self {
+    fn new(size: usize) -> Self {
         Self {
-            tiles: array::from_fn(|_| array::from_fn(|_| HashSet::new())),
-            scale
+            tiles: array::from_fn(|_| HashSet::new()),
+            scale: size / 10,
         }
     }
 
-    fn get(&mut self, coords: &Vector) -> &mut Tile {
-        &mut self.tiles[coords.y as usize / self.scale as usize][coords.x as usize / self.scale as usize]
+    fn index(&self, pos: &Vec2) -> usize {
+        let x = pos.x as usize / self.scale;
+        let y = pos.y as usize / self.scale;
+        I / 10 * y + x
     }
 
-    fn add(&mut self, coords: &Vector, id: Id) -> bool {
-        self.get(coords).insert(id)
+    fn get_mut(&mut self, pos: &Vec2) -> Option<&mut Tile> {
+        let index = self.index(pos);
+        self.tiles.get_mut(index)
     }
 
-    fn remove(&mut self, coords: &Vector, id: Id) {
-        self.get(coords).remove(&id);
+    fn add(&mut self, coords: &Vec2, id: Id) -> bool {
+        if let Some(tile) = self.get_mut(coords) {
+            tile.insert(id);
+            true
+        } else {false}
+    }
+
+    fn remove(&mut self, coords: &Vec2, id: Id) {
+        if let Some(tile) = self.get_mut(coords) {
+            tile.remove(&id);
+        }
     }
 }

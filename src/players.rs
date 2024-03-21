@@ -8,13 +8,13 @@ use tungstenite::{protocol::CloseFrame, Message};
 
 use crate::{events::{DirectionChange, UserEvent, UserMessage}, hubs::Id, Config};
 
-#[derive(Serialize, Clone, Debug)]
-pub struct Vector {
+#[derive(Serialize, Clone, Debug, PartialEq, PartialOrd)]
+pub struct Vec2 {
     pub x: f64,
     pub y: f64
 }
 
-impl Vector {
+impl Vec2 {
     pub fn empty() -> Self {
         Self {
             x: 0., 
@@ -22,7 +22,7 @@ impl Vector {
         }
     }
 
-    pub fn cap(&mut self, max: &Vector) -> &mut Self {
+    pub fn cap(&mut self, max: &Vec2) -> &mut Self {
         if self.x.abs() > max.x.abs() {
             self.x = max.x;
         } if self.y.abs() > max.y.abs() {
@@ -31,18 +31,24 @@ impl Vector {
         self
     }
 
-    pub fn combine(&mut self, other: &Vector) -> &mut Self {
+    #[inline]
+    pub fn add(&mut self, other: &Vec2) -> &mut Self {
         self.x += other.x;
         self.y += other.y;
         self
     }
 }
 
-pub fn yaw_coordinate_change(yaw: i32) -> Vector {
-    let radians = yaw as f64 * std::f64::consts::PI / 180.;
-    Vector { 
-        x: radians.sin(), 
-        y: radians.cos() 
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Debug)]
+pub struct Yaw(i16);
+
+impl Yaw {
+    fn to_vec(&self) -> Vec2 {
+        let radians = self.0 as f64 * std::f64::consts::PI / 180.;
+        Vec2 { 
+            x: radians.sin(), 
+            y: radians.cos() 
+        }
     }
 }
 
@@ -71,9 +77,9 @@ pub async fn handle_client_connection(mut conn: WebSocketStream<TcpStream>, mut 
 }
 
 async fn handle_message<'a>(
-    incoming_message: Option<Result<Message, 
-    tungstenite::error::Error>>, 
-    updates: &mpsc::Sender<UserMessage>, id: Id, 
+    incoming_message: Option<Result<Message, tungstenite::error::Error>>, 
+    updates: &mpsc::Sender<UserMessage>, 
+    id: Id, 
     conn: &mut WebSocketStream<TcpStream>) -> Option<Option<CloseFrame<'a>>> {
     let Some(Ok(message)) = incoming_message else {
         return Some(None);
@@ -99,38 +105,34 @@ async fn handle_message<'a>(
 
 #[derive(Debug)]
 pub struct Entity {
-    pub id: Id,
-    // Position in the map
-    pub coordinates: Vector,
-    // Amount coordinates is changed when moved
-    pub velocity: Vector,
-    // Max amount of amount coordinates is user
-    pub max_velocity: Vector,
-    // Amount velocity is changed when moved
-    pub acceleration: Vector,
-    pub target_yaw: i32,
-    pub yaw: i32,
+    pub coordinates: Vec2,
+    pub velocity: Vec2,
+    acceleration: Vec2,
+    max_velocity: Vec2,
+    target_yaw: Yaw,
+    pub yaw: Yaw,
     pub tank: Arc<Tank>,
     levels: [u8; 8],
     stats: EntityType,
-    pub shooting: bool
+    pub shooting: bool,
+    health: i8
 }
 
 impl Entity {
 
-    pub fn new(coords: Vector, id: Id, config: &Config, inner: EntityType) -> Self {
+    pub fn new(coords: Vec2, config: &Config, inner: EntityType) -> Self {
         Self {
-            id,
             coordinates: coords,
-            velocity: Vector::empty(),
-            max_velocity: Vector::empty(),
-            acceleration: Vector::empty(),
-            yaw: 0,
-            target_yaw: 0,
+            velocity: Vec2::empty(),
+            max_velocity: Vec2::empty(),
+            acceleration: Vec2::empty(),
+            yaw: Yaw(0),
+            target_yaw: Yaw(0),
             levels: array::from_fn(|_| 0),
             tank: config.tanks[0].clone(),
             stats: inner,
-            shooting: false
+            shooting: false,
+            health: 100
         }
     }
 
@@ -149,7 +151,7 @@ impl Entity {
         self.tank.base_stats[stat as usize]
     }
 
-    fn stat(&self, stat: Stat) -> i32 {
+    pub fn stat(&self, stat: Stat) -> i32 {
         (self.stat_multiplier(stat.clone()) * self.base_stat(stat) as f32) as i32
     }
     
@@ -174,16 +176,15 @@ impl Entity {
         }
     }
 
-    pub fn create_bullet(&self, cannon: &Cannon, id: Id) -> Self {
-        let yaw = self.yaw + cannon.yaw;
-        let direction = yaw_coordinate_change(yaw);
-        let bullet = EntityType::Bullet(Bullet { author: self.id });
+    pub fn create_bullet(&self, cannon: &Cannon, own_id: Id) -> Self {
+        let yaw = Yaw(self.yaw.0 + cannon.yaw);
+        let direction = yaw.to_vec();
+        let bullet = EntityType::Bullet(Bullet { author: own_id });
         Entity {
-            id,
             coordinates: self.coordinates.clone(),
             velocity: direction.clone(),
-            max_velocity: Vector { x: 0., y: 0. },
-            acceleration: Vector { x: direction.x / 10., y: direction.y / 10. },
+            max_velocity: Vec2::empty(),
+            acceleration: Vec2 { x: direction.x / 10., y: direction.y / 10. },
             yaw,
             target_yaw: yaw,
             tank: cannon.bullet.clone(),
@@ -194,31 +195,43 @@ impl Entity {
                 }
             }),
             stats: bullet,
-            shooting: false
+            shooting: false,
+            health: 100
         }
     }
 
     fn update_yaw(&mut self) {
-        if self.yaw < self.target_yaw {
-            self.yaw += 1;
+        if self.yaw.0 < self.target_yaw.0 {
+            self.yaw.0 += 1;
         } else {
-            self.yaw -= 1;
+            self.yaw.0 -= 1;
         }
     }
 
     pub fn update_movement(&mut self) {
-        self.coordinates.combine(&self.velocity);
-        self.velocity.combine(&self.acceleration).cap(&self.max_velocity);
+        self.coordinates.add(&self.velocity);
+        self.velocity.add(&self.acceleration).cap(&self.max_velocity);
         if self.yaw != self.target_yaw {
             self.update_yaw();
         }
     }
 
+    pub fn damage(&mut self, damage: i32) -> bool {
+        let max_health = self.stat(Stat::MaxHealth);
+        let health_change = max_health / damage;
+        self.health -= health_change as i8;
+        self.health < 0
+    }
+
+    pub fn distance_from(&self, other: &Entity) -> f64 {
+        ((self.coordinates.x - other.coordinates.x).powi(2) + (self.coordinates.y - other.coordinates.y).powi(2)).sqrt()
+    }
+
     fn change_direction(&mut self, direction: DirectionChange) {
-        let velocity = direction.to_velocity();
+        let velocity = direction.to_vec();
         let acceleration_x = velocity.x / 10.;
         let acceleration_y = velocity.y / 10.;
-        self.acceleration = Vector {
+        self.acceleration = Vec2 {
             x: if acceleration_x != 0. {acceleration_x} else {-self.max_velocity.x / 10.},
             y: if acceleration_y != 0. {acceleration_y} else {-self.max_velocity.y / 10.}
         };
@@ -260,7 +273,7 @@ impl Stat {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Cannon {
-    pub yaw: i32,
+    pub yaw: i16,
     pub delay: i32,
     pub size: i32,
     pub bullet: Arc<Tank>
