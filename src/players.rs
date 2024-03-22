@@ -111,7 +111,6 @@ pub struct Entity {
     pub velocity: Vec2,
     acceleration: Vec2,
     max_velocity: Vec2,
-    target_yaw: Yaw,
     pub yaw: Yaw,
     pub tank: Arc<Tank>,
     levels: [u8; 8],
@@ -129,7 +128,6 @@ impl Entity {
             max_velocity: Vec2::empty(),
             acceleration: Vec2::empty(),
             yaw: Yaw(0),
-            target_yaw: Yaw(0),
             levels: array::from_fn(|_| 0),
             tank: config.tanks[0].clone(),
             stats: inner,
@@ -188,7 +186,6 @@ impl Entity {
             max_velocity: Vec2::empty(),
             acceleration: Vec2 { x: direction.x / 10., y: direction.y / 10. },
             yaw,
-            target_yaw: yaw,
             tank: cannon.bullet.clone(),
             levels: array::from_fn(|i| {
                 match Stat::for_child(i) {
@@ -202,20 +199,9 @@ impl Entity {
         }
     }
 
-    fn update_yaw(&mut self) {
-        if self.target_yaw.0.abs_diff(self.yaw.0) < self.yaw.0.abs_diff(self.target_yaw.0) {
-            self.yaw.0 += 1;
-        } else {
-            self.yaw.0 -= 1;
-        }
-    }
-
     pub fn update_movement(&mut self, max: f64) {
         self.coordinates.add(&self.velocity).cap(&Vec2 { x: max, y: max });
         self.velocity.add(&self.acceleration).cap(&self.max_velocity);
-        if self.yaw != self.target_yaw {
-            self.update_yaw();
-        }
     }
 
     pub fn damage(&mut self, damage: i32) -> bool {
@@ -243,7 +229,7 @@ impl Entity {
     pub fn handle_event(&mut self, event: UserEvent) {
         match event {
             UserEvent::DirectionChange { direction } => self.change_direction(direction),
-            UserEvent::Yaw { yaw } => self.target_yaw = yaw,
+            UserEvent::Yaw { yaw } => self.yaw = yaw,
             UserEvent::SetShooting { shooting } => self.shooting = shooting,
             UserEvent::LevelUpgrade { stat } => self.increment_level(stat)
         };
