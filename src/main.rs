@@ -5,24 +5,27 @@ mod events;
 use std::{io::Error, path::Path, sync::Arc};
 use players::Tank;
 use serde::Deserialize;
-use log::info;
+use log::{info, warn};
 use tokio::net::TcpListener;
 use crate::hubs::HubManager;
 
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let _ = env_logger::try_init();
+    env_logger::try_init().expect("Failed to init logger");
     let mut hubs = HubManager::new().await;
     let listener = TcpListener::bind(&"127.0.0.1:8080".to_string()).await.expect("Failed to bind");
     info!("Listening on: http://localhost:8080/");
-    while let Ok((stream, _)) = listener.accept().await {
-        if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
-            hubs.create_client(ws_stream).await
+    loop {
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                if let Ok(ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                    hubs.create_client(ws_stream).await;
+                }
+            },
+            Err(e) => warn!("Error receiving request: {e:?}")
         }
     }
-
-    Ok(())
 }
 
 #[derive(Clone, Deserialize)]

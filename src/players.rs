@@ -97,7 +97,9 @@ async fn handle_message<'a>(
             }
         },
         Message::Close(close) => return Some(close),
-        Message::Ping(ping) => {let _ = conn.send(Message::Pong(ping.to_vec())).await;},
+        Message::Ping(ping) => {
+            let _ = conn.send(Message::Pong(ping.to_vec())).await;
+        },
         _ => {}
     };
     None
@@ -115,7 +117,7 @@ pub struct Entity {
     levels: [u8; 8],
     stats: EntityType,
     pub shooting: bool,
-    health: i8
+    health: i16
 }
 
 impl Entity {
@@ -201,15 +203,15 @@ impl Entity {
     }
 
     fn update_yaw(&mut self) {
-        if self.yaw.0 < self.target_yaw.0 {
+        if self.target_yaw.0.abs_diff(self.yaw.0) < self.yaw.0.abs_diff(self.target_yaw.0) {
             self.yaw.0 += 1;
         } else {
             self.yaw.0 -= 1;
         }
     }
 
-    pub fn update_movement(&mut self) {
-        self.coordinates.add(&self.velocity);
+    pub fn update_movement(&mut self, max: f64) {
+        self.coordinates.add(&self.velocity).cap(&Vec2 { x: max, y: max });
         self.velocity.add(&self.acceleration).cap(&self.max_velocity);
         if self.yaw != self.target_yaw {
             self.update_yaw();
@@ -218,9 +220,9 @@ impl Entity {
 
     pub fn damage(&mut self, damage: i32) -> bool {
         let max_health = self.stat(Stat::MaxHealth);
-        let health_change = max_health / damage;
-        self.health -= health_change as i8;
-        self.health < 0
+        let health_change = damage as f32 / max_health as f32 * 100.;
+        self.health -= health_change as i16;
+        self.health > 0
     }
 
     pub fn distance_from(&self, other: &Entity) -> f64 {
