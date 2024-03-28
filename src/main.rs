@@ -4,7 +4,7 @@ mod events;
 
 use std::{io::Error, path::Path, sync::Arc};
 use players::Tank;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use log::{info, warn};
 use tokio::net::TcpListener;
 use crate::hubs::HubManager;
@@ -28,12 +28,13 @@ async fn main() -> Result<(), Error> {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Config {
     max_player_count: i32,
     map_size: f64,
     update_delay_ms: u64,
-    tanks: Vec<Arc<Tank>>
+    tanks: Vec<Arc<Tank>>,
+    hit_delay: u32
 }
 
 impl Config {

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde;
 use crate::hubs::Id;
 use crate::players::{Vec2, Stat, Yaw};
+use crate::Config;
 
 
 #[derive(Deserialize)]
@@ -32,8 +33,13 @@ pub enum ServerEvent {
     #[serde(rename = "1")]
     EntityCreate { id: Id, tank: i32, position: Vec2 },
     #[serde(rename = "2")]
-    Position { user: Id, coordinates: Vec2, yaw: Yaw, velocity: Vec2 },
-    //TankUpgrade {user: Id, tank: i32},
+    Position { user: Id, coordinates: Vec2, yaw: Yaw, velocity: Vec2 }
+}
+
+#[derive(Serialize)]
+pub struct UserInit<'a> {
+    pub config: &'a Config,
+    pub you: Id
 }
 
 #[derive(Deserialize, Clone)]

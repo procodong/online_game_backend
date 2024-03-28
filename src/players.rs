@@ -6,21 +6,15 @@ use tokio::{net::TcpStream, sync::{broadcast, mpsc}};
 use tokio_tungstenite::WebSocketStream;
 use tungstenite::{protocol::CloseFrame, Message};
 
-use crate::{events::{DirectionChange, UserEvent, UserMessage}, hubs::Id, Config};
+use crate::{events::{DirectionChange, UserEvent, UserMessage}, hubs::Id};
 
-#[derive(Serialize, Clone, Debug, PartialEq, PartialOrd)]
+#[derive(Serialize, Clone, Debug, PartialEq, PartialOrd, Copy)]
 pub struct Vec2 {
     pub x: f64,
     pub y: f64
 }
 
 impl Vec2 {
-    pub fn empty() -> Self {
-        Self {
-            x: 0., 
-            y: 0.
-        }
-    }
 
     pub fn cap(&mut self, max: &Vec2) -> &mut Self {
         if self.x.abs() > max.x.abs() {
@@ -31,11 +25,23 @@ impl Vec2 {
         self
     }
 
-    #[inline]
     pub fn add(&mut self, other: &Vec2) -> &mut Self {
         self.x += other.x;
         self.y += other.y;
         self
+    }
+
+    pub fn map_with(&self, other: &Vec2, mapper: impl Fn(f64, f64) -> f64) -> Self {
+        Self {
+            x: mapper(self.x, other.x),
+            y: mapper(self.y, other.y)
+        }
+    }
+}
+
+impl Default for Vec2 {
+    fn default() -> Self {
+        Self { x: 0., y: 0. }
     }
 }
 
@@ -114,30 +120,34 @@ pub struct Entity {
     pub yaw: Yaw,
     pub tank: Arc<Tank>,
     levels: [u8; 8],
-    stats: EntityType,
+    pub inner: EntityType,
     pub shooting: bool,
-    health: i16
+    health: f32
 }
 
 impl Entity {
 
-    pub fn new(coords: Vec2, config: &Config, inner: EntityType) -> Self {
+    pub fn new(coords: Vec2, tank: Arc<Tank>, inner: EntityType) -> Self {
         Self {
             coordinates: coords,
-            velocity: Vec2::empty(),
-            max_velocity: Vec2::empty(),
-            acceleration: Vec2::empty(),
+            velocity: Vec2::default(),
+            max_velocity: Vec2::default(),
+            acceleration: Vec2::default(),
             yaw: Yaw(0),
             levels: array::from_fn(|_| 0),
-            tank: config.tanks[0].clone(),
-            stats: inner,
+            tank,
+            inner,
             shooting: false,
-            health: 100
+            health: 100.
         }
     }
 
     fn level(&self, stat: Stat) -> u8 {
         self.levels[stat as usize]
+    }
+
+    fn base_stat(&self, stat: Stat) -> f32 {
+        self.tank.base_stats[stat as usize]
     }
 
     fn stat_multiplier(&self, stat: Stat) -> f32 {
@@ -147,17 +157,13 @@ impl Entity {
         }
     }
 
-    fn base_stat(&self, stat: Stat) -> i32 {
-        self.tank.base_stats[stat as usize]
-    }
-
-    pub fn stat(&self, stat: Stat) -> i32 {
-        (self.stat_multiplier(stat.clone()) * self.base_stat(stat) as f32) as i32
+    pub fn stat(&self, stat: Stat) -> f32 {
+        self.stat_multiplier(stat.clone()) * self.base_stat(stat)
     }
     
     pub fn active_cannons(&self, tick: u32) -> impl Iterator<Item = &Cannon> {
-        let speed =  self.stat(Stat::Reload);
-        self.tank.cannons.iter().filter(move |c| c.delay * speed % tick as i32 == 0)
+        let speed =  self.stat(Stat::Reload) as u32;
+        self.tank.cannons.iter().filter(move |c| c.delay * speed % tick == 0)
     }
 
     const MAX_LEVEL: u8 = 10;
@@ -167,7 +173,7 @@ impl Entity {
         if current_level + 1 >= Self::MAX_LEVEL {
             return;
         }
-        if let EntityType::Player(p) = &mut self.stats {
+        if let EntityType::Player(p) = &mut self.inner {
             if p.points <= 0 {
                 return;
             }
@@ -179,12 +185,12 @@ impl Entity {
     pub fn create_bullet(&self, cannon: &Cannon, own_id: Id) -> Self {
         let yaw = Yaw(self.yaw.0 + cannon.yaw);
         let direction = yaw.to_vec();
-        let bullet = EntityType::Bullet(Bullet { author: own_id });
+        let bullet = EntityType::Bullet { author: own_id };
         Entity {
             coordinates: self.coordinates.clone(),
             velocity: direction.clone(),
-            max_velocity: Vec2::empty(),
-            acceleration: Vec2 { x: direction.x / 10., y: direction.y / 10. },
+            max_velocity: Vec2::default(),
+            acceleration: Vec2 { x: -direction.x / 10., y: -direction.y / 10. },
             yaw,
             tank: cannon.bullet.clone(),
             levels: array::from_fn(|i| {
@@ -193,9 +199,9 @@ impl Entity {
                     _ => 0
                 }
             }),
-            stats: bullet,
+            inner: bullet,
             shooting: false,
-            health: 100
+            health: 100.
         }
     }
 
@@ -204,11 +210,11 @@ impl Entity {
         self.velocity.add(&self.acceleration).cap(&self.max_velocity);
     }
 
-    pub fn damage(&mut self, damage: i32) -> bool {
+    pub fn damage(&mut self, damage: f32) -> bool {
         let max_health = self.stat(Stat::MaxHealth);
-        let health_change = damage as f32 / max_health as f32 * 100.;
-        self.health -= health_change as i16;
-        self.health > 0
+        let health_change = damage / max_health * 100.;
+        self.health -= health_change;
+        self.health > 0.
     }
 
     pub fn distance_from(&self, other: &Entity) -> f64 {
@@ -217,12 +223,13 @@ impl Entity {
 
     fn change_direction(&mut self, direction: DirectionChange) {
         let velocity = direction.to_vec();
-        let acceleration_x = velocity.x / 10.;
-        let acceleration_y = velocity.y / 10.;
-        self.acceleration = Vec2 {
-            x: if acceleration_x != 0. {acceleration_x} else {-self.max_velocity.x / 10.},
-            y: if acceleration_y != 0. {acceleration_y} else {-self.max_velocity.y / 10.}
-        };
+        self.acceleration = velocity.map_with(&self.max_velocity, |acceleration, max_velocity| {
+            if acceleration != 0. {
+                acceleration / 10.
+            } else {
+                -max_velocity / 10.
+            }
+        });
         self.max_velocity = velocity;
     }
 
@@ -259,41 +266,31 @@ impl Stat {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Cannon {
     pub yaw: i16,
-    pub delay: i32,
+    pub delay: u32,
     pub size: i32,
     pub bullet: Arc<Tank>
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Tank {
     pub cannons: Vec<Cannon>,
-    pub base_stats: [i32; 8],
+    pub base_stats: [f32; 8],
     pub size: f64,
     pub id: i32
 }
 
-impl Serialize for Tank {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_i32(self.id)
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug)]
 pub enum EntityType {
     Player(Player),
-    Bullet(Bullet)
+    Bullet { author: Id },
+    Prop
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug)]
 pub struct Player {
     pub points: i32,
     pub score: i32
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub struct Bullet {
-    pub author: Id
 }
